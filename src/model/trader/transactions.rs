@@ -1,4 +1,4 @@
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use super::accounts::AssetType;
@@ -244,7 +244,7 @@ pub struct TransactionBaseInstrument {
     pub cusip: Option<String>,
     pub symbol: String,
     pub description: Option<String>,
-    pub instrument_id: i64,
+    pub instrument_id: Option<i64>,
     pub net_change: Option<f64>,
 
     // not in schema
@@ -465,7 +465,7 @@ pub enum TransferItemPositionEffect {
 mod tests {
     use super::*;
 
-    use assert_json_diff::{assert_json_matches_no_panic, CompareMode, Config, NumericMode};
+    use assert_json_diff::{CompareMode, Config, NumericMode, assert_json_matches_no_panic};
 
     #[test]
     fn test_de() {

@@ -1,7 +1,7 @@
 //! APIs to access Account Balances & Positions, to perform trading activities
 //! [API Documentation](https://developer.schwab.com/products/trader-api--individual/details/specifications/Retail%20Trader%20API%20Production)
 
-use reqwest::{Client, RequestBuilder, StatusCode};
+use reqwest::{Client, RequestBuilder, StatusCode, header::HeaderMap};
 
 use super::endpoints;
 use super::parameter::{Status, TransactionType};
@@ -366,18 +366,31 @@ impl PostAccountOrderRequest {
         self.req.json(&self.body)
     }
 
-    pub async fn send(self) -> Result<(), Error> {
+    pub async fn send(self) -> Result<Option<i64>, Error> {
         let req = self.build();
+
         let rsp = req.send().await?;
 
         let status = rsp.status();
+
         if status != StatusCode::CREATED {
             let error_response = rsp.json::<model::ServiceError>().await?;
             return Err(Error::Service(error_response));
         }
 
-        Ok(())
+        Ok(parse_order_id_from_headers(rsp.headers()))
     }
+}
+
+fn parse_order_id_from_headers(headers: &HeaderMap) -> Option<i64> {
+    let url = headers.get("location")?.to_str().ok()?;
+
+    url::Url::parse(url)
+        .ok()?
+        .path_segments()?
+        .next_back()?
+        .parse::<i64>()
+        .ok()
 }
 
 /// Get a specific order by its ID, for a specific account
@@ -499,6 +512,7 @@ impl DeleteAccountOrderRequest {
         let rsp = req.send().await?;
 
         let status = rsp.status();
+
         if status != StatusCode::OK {
             let error_response = rsp.json::<model::ServiceError>().await?;
             return Err(Error::Service(error_response));
@@ -563,7 +577,7 @@ impl PutAccountOrderRequest {
         self.req.json(&self.body)
     }
 
-    pub async fn send(self) -> Result<(), Error> {
+    pub async fn send(self) -> Result<Option<i64>, Error> {
         let req = self.build();
         let rsp = req.send().await?;
 
@@ -573,7 +587,7 @@ impl PutAccountOrderRequest {
             return Err(Error::Service(error_response));
         }
 
-        Ok(())
+        Ok(parse_order_id_from_headers(rsp.headers()))
     }
 }
 
@@ -698,7 +712,7 @@ pub struct PostAccountPreviewOrderRequest {
     /// The encrypted ID of the account
     account_number: String,
 
-    body: model::PreviewOrder,
+    body: model::OrderRequest,
 }
 
 impl PostAccountPreviewOrderRequest {
@@ -710,7 +724,7 @@ impl PostAccountPreviewOrderRequest {
         client: &Client,
         access_token: String,
         account_number: String,
-        body: model::PreviewOrder,
+        body: model::OrderRequest,
     ) -> Self {
         let req = client
             .post(Self::endpoint(account_number.clone()).url())
@@ -718,7 +732,7 @@ impl PostAccountPreviewOrderRequest {
         Self::new_with(req, account_number, body)
     }
 
-    fn new_with(req: RequestBuilder, account_number: String, body: model::PreviewOrder) -> Self {
+    fn new_with(req: RequestBuilder, account_number: String, body: model::OrderRequest) -> Self {
         Self {
             req,
             account_number,
@@ -739,6 +753,12 @@ impl PostAccountPreviewOrderRequest {
             let error_response = rsp.json::<model::ServiceError>().await?;
             return Err(Error::Service(error_response));
         }
+
+        // let json = rsp.text().await.unwrap();
+        // dbg!(&json);
+        // let v: model::PreviewOrder = serde_json::from_str(&json).unwrap();
+        // println!("{:#?}", v);
+        // panic!();
 
         rsp.json::<model::PreviewOrder>()
             .await
@@ -979,6 +999,39 @@ mod tests {
     use mockito::Matcher;
     use pretty_assertions::assert_eq;
     use reqwest::Client;
+    use reqwest::header::HeaderValue;
+
+    #[tokio::test]
+    async fn test_parse_order_id_from_headers() {
+        let mut header_map = HeaderMap::new();
+        let url = endpoints::EndpointOrder::Order {
+            account_number: "account_number".to_string(),
+            order_id: 123_456,
+        }
+        .url();
+        let value = HeaderValue::from_str(&url).unwrap();
+        header_map.insert("location", value);
+
+        let result = parse_order_id_from_headers(&header_map);
+
+        // Check happy path
+        assert_eq!(result.unwrap(), 123_456);
+
+        // Check for failure when location missing
+        header_map.remove("location");
+        let result = parse_order_id_from_headers(&header_map);
+        assert_eq!(result, None,);
+
+        // Check for failure when not parsable to i64
+        let url = "https://api.schwabapi.com/trader/v1/accounts/accountNumber/orders/not_an_i64";
+        let value = HeaderValue::from_str(url).unwrap();
+        header_map.insert("location", value);
+        let result = parse_order_id_from_headers(&header_map);
+        assert_eq!(result, None);
+
+        // We don't currently test the "not a String" or next_back() failures as it does not appear
+        // to be possible to construct a HeaderValue without a String.
+    }
 
     #[tokio::test]
     async fn test_get_account_numbers_request() {
@@ -1042,7 +1095,7 @@ mod tests {
             .mock("GET", "/accounts")
             .match_query(Matcher::AllOf(vec![Matcher::UrlEncoded(
                 "fields".into(),
-                fields.to_string(),
+                fields.clone(),
             )]))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -1096,7 +1149,7 @@ mod tests {
             .mock("GET", "/accounts/account_number")
             .match_query(Matcher::AllOf(vec![Matcher::UrlEncoded(
                 "fields".into(),
-                fields.to_string(),
+                fields.clone(),
             )]))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -1234,6 +1287,14 @@ mod tests {
             .mock("POST", "/accounts/account_number/orders")
             .with_status(201)
             .with_header("content-type", "application/json")
+            .with_header(
+                "location",
+                &endpoints::EndpointOrder::Order {
+                    account_number: "account_number".to_string(),
+                    order_id: 123_456,
+                }
+                .url(),
+            )
             .match_body(mockito::Matcher::Json(
                 serde_json::to_value(body.clone()).unwrap(),
             ))
@@ -1259,6 +1320,7 @@ mod tests {
         let result = req.send().await;
         mock.assert_async().await;
         assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(123_456));
     }
 
     #[tokio::test]
@@ -1369,6 +1431,14 @@ mod tests {
             .mock("PUT", "/accounts/account_number/orders/123")
             .with_status(201)
             .with_header("content-type", "application/json")
+            .with_header(
+                "location",
+                &endpoints::EndpointOrder::Order {
+                    account_number: "account_number".to_string(),
+                    order_id: 123_456,
+                }
+                .url(),
+            )
             .match_body(Matcher::Json(serde_json::to_value(body.clone()).unwrap()))
             .create_async()
             .await;
@@ -1394,6 +1464,7 @@ mod tests {
         let result = req.send().await;
         mock.assert_async().await;
         assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some(123_456));
     }
 
     #[tokio::test]
@@ -1483,7 +1554,7 @@ mod tests {
 
         // define parameter
         let account_number = "account_number".to_string();
-        let body = model::PreviewOrder::default();
+        let body = model::OrderRequest::default();
 
         // Create a mock
         let mock = server
@@ -1493,6 +1564,63 @@ mod tests {
             .with_body_from_file(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/tests/model/Trader/PreviewOrder.json"
+            ))
+            .create_async()
+            .await;
+
+        let client = Client::new();
+        let req = client.post(format!(
+            "{url}{}",
+            PostAccountPreviewOrderRequest::endpoint(account_number.clone()).url_endpoint()
+        ));
+
+        let req =
+            PostAccountPreviewOrderRequest::new_with(req, account_number.clone(), body.clone());
+
+        // check initial value
+        assert_eq!(req.account_number, account_number);
+        assert_eq!(req.body, body);
+
+        // check setter
+        // none
+
+        dbg!(&req);
+        let result = req.send().await;
+        mock.assert_async().await;
+        let result = result.unwrap();
+        assert_eq!(result.order_id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_post_account_preview_order_request_real() {
+        // Request a new server from the pool
+        let mut server = mockito::Server::new_async().await;
+
+        // Use one of these addresses to configure your client
+        let _host = server.host_with_port();
+        let url = server.url();
+
+        // define parameter
+        let account_number = "account_number".to_string();
+
+        let body = model::OrderRequest::limit(
+            model::InstrumentRequest::Equity {
+                symbol: "VEA".to_string(),
+            },
+            model::Instruction::Buy,
+            1.0,
+            10.0,
+        )
+        .unwrap();
+
+        // Create a mock
+        let mock = server
+            .mock("POST", "/accounts/account_number/previewOrder")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body_from_file(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/model/Trader/PreviewOrder_real.json"
             ))
             .create_async()
             .await;
@@ -1552,7 +1680,7 @@ mod tests {
             .match_query(Matcher::AllOf(vec![
                 Matcher::UrlEncoded("startDate".into(), start_date.format("%+").to_string()),
                 Matcher::UrlEncoded("endDate".into(), end_date.format("%+").to_string()),
-                Matcher::UrlEncoded("symbol".into(), symbol.to_string()),
+                Matcher::UrlEncoded("symbol".into(), symbol.clone()),
                 Matcher::UrlEncoded("types".into(), "RECEIVE_AND_DELIVER".into()),
             ]))
             .with_status(200)

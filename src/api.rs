@@ -14,7 +14,7 @@ use parameter::{Market, Projection, TransactionType};
 /// Interacting with the Schwab API.
 #[derive(Debug)]
 pub struct Api<T: Tokener> {
-    tokener: T,
+    pub tokener: T,
     client: Client,
 }
 
@@ -352,7 +352,7 @@ impl<T: Tokener> Api<T> {
     pub async fn post_accounts_preview_order(
         &self,
         account_number: String,
-        body: model::PreviewOrder,
+        body: model::OrderRequest,
     ) -> Result<trader::PostAccountPreviewOrderRequest, Error> {
         let access_token = self.tokener.get_access_token().await?;
 
@@ -446,15 +446,25 @@ mod tests {
     use crate::model::trader::order_request::InstrumentRequest;
     use crate::model::trader::preview_order::Instruction;
     use crate::token::TokenChecker;
+    use crate::token::channel_messenger::ChannelMessenger;
+    use crate::token::channel_messenger::compound_messenger::CompoundMessenger;
+    use crate::token::channel_messenger::local_server::LocalServerMessenger;
+    use crate::token::channel_messenger::stdio_messenger::StdioMessenger;
 
-    async fn client() -> Api<TokenChecker> {
+    async fn client() -> Api<TokenChecker<impl ChannelMessenger>> {
         #[allow(clippy::option_env_unwrap)]
         let key = option_env!("SCHWAB_API_KEY")
-            .expect("There should be SCHWAB API KEY")
+            .expect("The environment variable SCHWAB_API_KEY sholud be set")
             .to_string();
+
         #[allow(clippy::option_env_unwrap)]
         let secret = option_env!("SCHWAB_SECRET")
-            .expect("There should be SCHWAB SECRET")
+            .expect("The environment variable SCHWAB_SECRET sholud be set")
+            .to_string();
+
+        #[allow(clippy::option_env_unwrap)]
+        let callback_url = option_env!("SCHWAB_CALLBACK_URL")
+            .expect("The environment variable SCHWAB_CALLBACK_URL sholud be set")
             .to_string();
 
         let path = dirs::home_dir()
@@ -463,21 +473,29 @@ mod tests {
             .join("Schwab-rust.json");
 
         let certs_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/certs"));
-
-        let callback_url = "https://127.0.0.1:8080".to_string();
+        let messenger = CompoundMessenger::new(
+            LocalServerMessenger::new(&certs_dir).await,
+            StdioMessenger::new(),
+        );
 
         let client = Client::new();
-        let token_checker =
-            TokenChecker::new(path, key, secret, callback_url, certs_dir, client.clone())
-                .await
-                .unwrap();
+        let token_checker = TokenChecker::new_with_custom_auth(
+            path,
+            key,
+            secret,
+            callback_url,
+            client.clone(),
+            messenger,
+        )
+        .await
+        .unwrap();
 
         Api::new(token_checker, client).await.unwrap()
     }
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_quotes() {
@@ -514,7 +532,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_quote() {
@@ -552,7 +570,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_option_chains() {
@@ -569,17 +587,18 @@ mod tests {
         let api = client().await;
         let req = api.get_option_chains(symbol).await.unwrap();
         let rsp = req.send().await.unwrap();
-        if let Some(v) = rsp.call_exp_date_map.into_values().next() {
-            if let Some(mut v) = v.into_values().next() {
-                return v.pop().expect("must exist").symbol;
-            }
+        if let Some(v) = rsp.call_exp_date_map.into_values().next()
+            && let Some(mut v) = v.into_values().next()
+        {
+            return v.pop().expect("must exist").symbol;
         }
+
         unreachable!()
     }
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_option_expiration_chain() {
@@ -594,7 +613,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_price_history() {
@@ -606,7 +625,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_movers() {
@@ -618,7 +637,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_markets() {
@@ -633,7 +652,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_market() {
@@ -645,7 +664,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_instruments() {
@@ -674,7 +693,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_instrument() {
@@ -686,7 +705,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_account_numbers() {
@@ -705,7 +724,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_accounts() {
@@ -717,7 +736,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_account() {
@@ -729,7 +748,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_account_orders() {
@@ -782,7 +801,7 @@ mod tests {
 
     #[cfg_attr(
         not(all(feature = "test_online", feature = "danger")),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
@@ -796,6 +815,16 @@ mod tests {
         let price = 10.0;
         let modified_price = 11.0;
 
+        // preview
+        let order_preview =
+            model::OrderRequest::limit(symbol.clone(), Instruction::Buy, quantity, price).unwrap();
+        let req = api
+            .post_accounts_preview_order(account_number().await, order_preview)
+            .await
+            .unwrap();
+        let preview = req.send().await.unwrap();
+        dbg!(preview);
+
         // post
         let order_post =
             model::OrderRequest::limit(symbol.clone(), Instruction::Buy, quantity, price).unwrap();
@@ -803,26 +832,15 @@ mod tests {
             .post_account_order(account_number().await, order_post.clone())
             .await
             .unwrap();
-        req.send().await.unwrap();
+        let order_id = req.send().await.unwrap().unwrap();
 
         // post check
         let req = api
-            .get_account_orders(
-                account_number().await,
-                chrono::Local::now()
-                    .checked_sub_days(chrono::Days::new(1))
-                    .unwrap()
-                    .to_utc(),
-                chrono::Local::now()
-                    .checked_add_days(chrono::Days::new(1))
-                    .unwrap()
-                    .to_utc(),
-            )
+            .get_account_order(account_number().await, order_id)
             .await
             .unwrap();
-        let orders = req.send().await.unwrap();
-        dbg!(&orders);
-        let order_post_check = orders[0].clone();
+        let order_post_check = req.send().await.unwrap();
+        dbg!(&order_post_check);
         assert_eq!(
             order_post_check.session,
             model::trader::order::Session::Normal
@@ -860,10 +878,9 @@ mod tests {
             .put_account_order(account_number().await, order_id, order_put.clone())
             .await
             .unwrap();
-        req.send().await.unwrap();
+        let order_id = req.send().await.unwrap().unwrap();
 
         // put check
-        let order_id = order_id + 1;
         let req = api
             .get_account_order(account_number().await, order_id)
             .await
@@ -921,7 +938,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_account_order() {
@@ -936,7 +953,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_accounts_orders() {
@@ -963,24 +980,34 @@ mod tests {
     }
 
     #[cfg_attr(
-        not(all(feature = "test_online", feature = "danger")),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        not(all(feature = "test_online")),
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_post_accounts_preview_order() {
-        unimplemented!("comming soon by schwab");
-        // let api = client().await;
-        // let req = api
-        //     .post_accounts_preview_order(account_number().await, model::PreviewOrder::default())
-        //     .await
-        //     .unwrap();
-        // let rsp = req.send().await.unwrap();
-        // dbg!(rsp);
+        let api = client().await;
+        let req = api
+            .post_accounts_preview_order(
+                account_number().await,
+                model::OrderRequest::limit(
+                    InstrumentRequest::Equity {
+                        symbol: "VEA".to_string(),
+                    },
+                    Instruction::Buy,
+                    1.0,
+                    10.0,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let rsp = req.send().await.unwrap();
+        dbg!(rsp);
     }
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_account_transactions() {
@@ -1038,7 +1065,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_account_transaction() {
@@ -1055,7 +1082,7 @@ mod tests {
 
     #[cfg_attr(
         not(feature = "test_online"),
-        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY and SCHWAB_SECRET need to be provided in the environment."#
+        ignore = r#"Without the "test_online" feature enabled, to activate it, corresponding SCHWAB_API_KEY, SCHWAB_SECRET and SCHWAB_CALLBACK_URL need to be provided in the environment."#
     )]
     #[tokio::test]
     async fn test_get_user_preference() {
