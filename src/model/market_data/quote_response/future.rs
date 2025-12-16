@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde::Serialize;
-use serde_with::{serde_as, TimestampMilliSeconds};
+use serde_with::{TimestampMilliSeconds, serde_as};
 
 /// Quote info of Future security
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -90,11 +90,11 @@ pub struct QuoteFuture {
     ///
     /// Day's high trade price
     pub high_price: f64,
-    #[serde(rename = "lastMICId")]
 
     /// example: XNYS
     ///
     /// Last MIC Code
+    #[serde(rename = "lastMICId")]
     pub last_micid: Option<String>,
 
     /// example: 4083

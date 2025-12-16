@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use serde::Serialize;
-use serde_with::{serde_as, TimestampMilliSeconds};
+use serde_with::{TimestampMilliSeconds, serde_as};
 
 /// Quote info of Option security
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -339,7 +339,6 @@ pub enum ExerciseType {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ExpirationType {
     /// M for End Of Month Expiration Calendar Cycle. (To match the last business day of the month)
-
     #[serde(rename = "M")]
     Month,
 

@@ -168,6 +168,7 @@ mod custom_date_format {
 
     const FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
+    #[allow(clippy::ref_option)]
     pub fn serialize<S>(date: &Option<NaiveDateTime>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -196,7 +197,7 @@ mod custom_date_format {
 mod tests {
     use super::*;
 
-    use assert_json_diff::{assert_json_matches_no_panic, CompareMode, Config, NumericMode};
+    use assert_json_diff::{CompareMode, Config, NumericMode, assert_json_matches_no_panic};
 
     #[test]
     fn test_de() {
