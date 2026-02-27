@@ -31,7 +31,7 @@ pub struct Candle {
     pub high: f64,
     pub low: f64,
     pub open: f64,
-    pub volume: u64,
+    pub volume: f64,
 }
 
 #[cfg(test)]
