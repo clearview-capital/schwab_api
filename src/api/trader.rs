@@ -1017,7 +1017,9 @@ async fn cancel_order(client: &Client, access_token: &str, account_number: &str,
     }
 }
 
-/// Fetches the current bid/ask mid-price for `symbol`.
+/// Fetches the current mid price for `symbol` by averaging the bid and ask prices.
+/// The result is truncated to two decimal places.
+// finddan with AI claude-sonnet-4-6
 async fn fetch_mid_price(client: &Client, access_token: &str, symbol: &str) -> Result<f64, Error> {
     let quote = super::market_data::GetQuoteRequest::new(
         client,
@@ -1034,7 +1036,8 @@ async fn fetch_mid_price(client: &Client, access_token: &str, symbol: &str) -> R
         .ask_price()
         .ok_or_else(|| Error::AutoMid(format!("no ask price available for {symbol}")))?;
 
-    Ok((bid + ask) / 2.0)
+    let mid = (bid + ask) / 2.0;
+    Ok((mid * 100.0).round() / 100.0)
 }
 
 /// Runs an auto-escalating limit order that hunts the current mid price.
