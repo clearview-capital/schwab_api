@@ -374,7 +374,9 @@ impl PostAccountOrderRequest {
         let status = rsp.status();
 
         if status != StatusCode::CREATED {
-            let error_response = rsp.json::<model::ServiceError>().await?;
+            let raw = rsp.text().await?;
+            log::error!("PostAccountOrder failed (status {}): {}", status, raw);
+            let error_response: model::ServiceError = serde_json::from_str(&raw)?;
             return Err(Error::Service(error_response));
         }
 
@@ -1149,6 +1151,8 @@ impl AutoMidOrderRequest {
             quantity,
             initial_mid,
         )?;
+
+        log::debug!("Auto mid order will create the following initial order: {:?}", initial);
 
         let mut current_order_id = PostAccountOrderRequest::new(
             &client,
