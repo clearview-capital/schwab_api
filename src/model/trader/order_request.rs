@@ -323,6 +323,31 @@ impl From<InstrumentResponse> for InstrumentRequest {
     }
 }
 
+/// Which asset class to trade in an auto-mid order.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AutoMidAssetType {
+    Equity,
+    Option,
+}
+
+/// Result returned after an auto-mid order sequence completes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AutoMidOrderResponse {
+    /// Whether the order was successfully created.
+    pub created: bool,
+    /// The final order ID (may change if the order was replaced during the run).
+    pub order_id: Option<u64>,
+    /// Number of polling loops that ran before completion.
+    pub loops: u32,
+    /// Total fill value (price × quantity × multiplier), when available.
+    pub fill_value: Option<f64>,
+    /// `true` if the order was ultimately converted to a market order.
+    pub market_order: bool,
+    /// Human-readable status message.
+    pub message: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

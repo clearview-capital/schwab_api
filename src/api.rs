@@ -346,6 +346,37 @@ impl<T: Tokener> Api<T> {
         ))
     }
 
+    /// Runs an auto-escalating limit order that hunts the current mid price.
+    ///
+    /// See [`trader::AutoMidOrderRequest`] for full documentation.
+    pub async fn auto_mid_order(
+        &self,
+        account_number: String,
+        symbol: String,
+        quantity: f64,
+        instruction: model::Instruction,
+        asset_type: model::AutoMidAssetType,
+        update_interval: f64,
+        order_value_max_percent_change: f64,
+        max_attempt_duration: Option<f64>,
+        enable_market_order_conversion: bool,
+    ) -> Result<trader::AutoMidOrderRequest, Error> {
+        let access_token = self.tokener.get_access_token().await?;
+        Ok(trader::AutoMidOrderRequest::new(
+            &self.client,
+            access_token,
+            account_number,
+            symbol,
+            quantity,
+            instruction,
+            asset_type,
+            update_interval,
+            order_value_max_percent_change,
+            max_attempt_duration,
+            enable_market_order_conversion,
+        ))
+    }
+
     /// `account_number`
     ///
     /// The encrypted ID of the account

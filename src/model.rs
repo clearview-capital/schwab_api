@@ -19,6 +19,8 @@ pub use trader::account_number::AccountNumbers;
 pub use trader::accounts::Account;
 pub use trader::accounts::Accounts;
 pub use trader::order::Order;
+pub use trader::order_request::AutoMidAssetType;
+pub use trader::order_request::AutoMidOrderResponse;
 pub use trader::order_request::InstrumentRequest;
 pub use trader::order_request::OrderRequest;
 pub use trader::preview_order::Instruction;
