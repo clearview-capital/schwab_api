@@ -995,6 +995,64 @@ impl GetUserPreferenceRequest {
 /// Best-effort order cancellation used for cleanup on unexpected errors.
 /// Logs a warning if the API call itself fails — there is nothing more that can
 /// be done at that point, but the caller should surface an error to the user.
+
+/// Outcome of a [`replace_limit_order`] call.
+enum ReplaceOutcome {
+    /// The order was successfully replaced; contains the new order ID if one was returned.
+    Replaced(Option<i64>),
+    /// The order was already filled before the replace was attempted; contains the filled order.
+    AlreadyFilled(model::Order),
+}
+
+/// Attempts to replace an existing limit order with `new_order`, but first re-checks
+/// the order's current status. If the order is already `Filled` the replace is skipped
+/// and `ReplaceOutcome::AlreadyFilled` is returned so the caller can complete successfully
+/// without treating the fill as an error.
+// finddan with AI claude-sonnet-4-6
+async fn replace_limit_order(
+    client: &Client,
+    access_token: &str,
+    account_number: &str,
+    order_id: i64,
+    new_order: model::OrderRequest,
+) -> Result<ReplaceOutcome, Error> {
+    use model::trader::order::Status as OrderStatus;
+
+    let order = GetAccountOrderRequest::new(
+        client,
+        access_token.to_string(),
+        account_number.to_string(),
+        order_id,
+    )
+    .send()
+    .await
+    .map_err(|e| Error::AutoMid(format!("Failed to check order status before replace: {e}")))?;
+
+    if order.status == OrderStatus::Filled {
+        log::info!(
+            "Order {} is already filled — skipping replace for account {}",
+            order_id,
+            account_number
+        );
+        return Ok(ReplaceOutcome::AlreadyFilled(order));
+    }
+
+    let new_id = PutAccountOrderRequest::new(
+        client,
+        access_token.to_string(),
+        account_number.to_string(),
+        order_id,
+        new_order,
+    )
+    .send()
+    .await
+    .map_err(|e| Error::AutoMid(format!("Failed to update limit price: {e}")))?;
+
+    Ok(ReplaceOutcome::Replaced(new_id))
+}
+
+/// Cancels an existing order, logging any errors without propagating them.
+// finddan with AI claude-sonnet-4-6
 async fn cancel_order(client: &Client, access_token: &str, account_number: &str, order_id: i64) {
     match DeleteAccountOrderRequest::new(
         client,
@@ -1363,23 +1421,50 @@ impl AutoMidOrderRequest {
                 }
             };
 
-            let new_id = match PutAccountOrderRequest::new(
+            let new_id = match replace_limit_order(
                 &client,
-                access_token.clone(),
-                account_number.clone(),
+                &access_token,
+                &account_number,
                 current_order_id,
                 adjusted,
             )
-            .send()
             .await
             {
-                Ok(id) => id,
+                Ok(ReplaceOutcome::Replaced(id)) => id,
+                Ok(ReplaceOutcome::AlreadyFilled(order)) => {
+                    log::info!(
+                        "Auto-mid order {} filled (detected before replace) for account {}",
+                        current_order_id,
+                        account_number
+                    );
+                    let multiplier = match asset_type {
+                        model::AutoMidAssetType::Option => 100.0,
+                        model::AutoMidAssetType::Equity => 1.0,
+                    };
+                    let fill_value =
+                        if let Some(activities) = &order.order_activity_collection {
+                            let total: f64 = activities
+                                .iter()
+                                .flat_map(|a| a.execution_legs.iter())
+                                .map(|leg| leg.price * leg.quantity * multiplier)
+                                .sum();
+                            if total > 0.0 { Some(total) } else { None }
+                        } else {
+                            order.price.map(|p| p * order.quantity * multiplier)
+                        };
+                    return Ok(model::AutoMidOrderResponse {
+                        created: true,
+                        order_id: Some(current_order_id as u64),
+                        loops: loop_count,
+                        fill_value,
+                        market_order: false,
+                        message: Some("Order filled".into()),
+                    });
+                }
                 Err(e) => {
-                    cancel_order(&client, &access_token, &account_number, current_order_id).await;
-                    return Err(Error::AutoMid(format!(
-                        "Failed to update limit price: {}",
-                        e
-                    )));
+                    cancel_order(&client, &access_token, &account_number, current_order_id)
+                        .await;
+                    return Err(e);
                 }
             };
 
