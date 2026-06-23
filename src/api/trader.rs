@@ -1011,15 +1011,17 @@ fn price_step(
     order_value_max_percent_change / num_loops
 }
 
-/// Calculates the next limit price by applying a directional percentage offset to `mid`.
-/// For buys the price is raised; for sells it is lowered.
+/// Calculates the next limit price by applying a directional percentage offset to `mid`,
+/// then clamping the result so it never crosses the live spread:
+/// - buys are capped at `ask` (we never need to pay more than the market offers)
+/// - sells are floored at `bid` (we never need to accept less than the market bids)
 /// The result is rounded to two decimal places.
 // finddan with AI claude-sonnet-4-6
-fn next_limit_price(mid: f64, percent: f64, is_buy: bool) -> f64 {
+fn next_limit_price(mid: f64, percent: f64, is_buy: bool, bid: f64, ask: f64) -> f64 {
     let price = if is_buy {
-        mid * (1.0 + percent)
+        (mid * (1.0 + percent)).min(ask)
     } else {
-        mid * (1.0 - percent)
+        (mid * (1.0 - percent)).max(bid)
     };
     (price * 100.0).round() / 100.0
 }
@@ -1094,6 +1096,13 @@ pub struct AutoMidOrderRequest {
     enable_market_order_conversion: bool,
 }
 
+/// Bid, ask, and rounded mid price for a symbol.
+struct MidPrice {
+    bid: f64,
+    ask: f64,
+    mid: f64,
+}
+
 impl AutoMidOrderRequest {
     pub(crate) fn new(
         client: &Client,
@@ -1147,7 +1156,7 @@ impl AutoMidOrderRequest {
         );
 
         // Fetch the initial mid price and place the first order there.
-        let initial_mid = self
+        let initial_quote = self
             .fetch_mid_price()
             .await
             .map_err(|e| Error::AutoMid(format!("Failed to fetch initial mid price: {e}")))?;
@@ -1157,7 +1166,7 @@ impl AutoMidOrderRequest {
             self.instrument.clone(),
             self.instruction,
             self.quantity,
-            initial_mid,
+            initial_quote.mid,
         )?;
 
         log::debug!(
@@ -1178,7 +1187,7 @@ impl AutoMidOrderRequest {
         log::info!(
             "Auto-mid order {} placed at mid {:.4}",
             current_order_id,
-            initial_mid
+            initial_quote.mid
         );
 
         let start = std::time::Instant::now();
@@ -1203,8 +1212,8 @@ impl AutoMidOrderRequest {
             }
 
             // Re-fetch the live mid price to base this loop's limit price on.
-            let current_mid = match self.fetch_mid_price().await {
-                Ok(m) => m,
+            let current_quote = match self.fetch_mid_price().await {
+                Ok(q) => q,
                 Err(e) => {
                     log::warn!(
                         "Failed to fetch mid price for order {}, skipping loop: {e}",
@@ -1214,15 +1223,15 @@ impl AutoMidOrderRequest {
                 }
             };
 
-            // Apply an incrementally increasing offset to the current mid:
-            // loop 1 → step*1, loop 2 → step*2, … loop N → order_value_max_percent_change.
+            // Apply an incrementally increasing offset to the current mid,
+            // clamped so the price never crosses the live bid/ask spread.
             let percent = step * f64::from(loop_count);
-            let next_price = next_limit_price(current_mid, percent, is_buy);
+            let next_price = next_limit_price(current_quote.mid, percent, is_buy, current_quote.bid, current_quote.ask);
 
             log::info!(
-                "Auto-mid {}: mid={:.4}, percent={:.4}%, next_price={:.2}",
+                "Auto-mid {}: mid={:.4}, percent={:.4}%, order_price={:.2}",
                 current_order_id,
-                current_mid,
+                current_quote.mid,
                 percent * 100.0,
                 next_price
             );
@@ -1302,7 +1311,7 @@ impl AutoMidOrderRequest {
     /// Fetches the current mid price for the instrument by averaging bid and ask.
     /// The result is rounded to two decimal places.
     // finddan with AI claude-sonnet-4-6
-    async fn fetch_mid_price(&self) -> Result<f64, Error> {
+    async fn fetch_mid_price(&self) -> Result<MidPrice, Error> {
         let symbol = self.instrument.symbol();
         let fetch_start = std::time::Instant::now();
         let quote = super::market_data::GetQuoteRequest::new(
@@ -1327,11 +1336,11 @@ impl AutoMidOrderRequest {
 
         let mid = (bid + ask) / 2.0;
         let mid_rounded = (mid * 100.0).round() / 100.0;
-        log::info!(
+        log::debug!(
             "fetch_mid_price: {} bid={:.4} ask={:.4} mid={:.4}",
             symbol, bid, ask, mid_rounded
         );
-        Ok(mid_rounded)
+        Ok(MidPrice { bid, ask, mid: mid_rounded })
     }
 
     /// Attempts to replace an existing limit order with `new_order`, but first re-checks
