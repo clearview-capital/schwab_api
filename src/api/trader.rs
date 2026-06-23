@@ -996,109 +996,76 @@ impl GetUserPreferenceRequest {
 /// Logs a warning if the API call itself fails — there is nothing more that can
 /// be done at that point, but the caller should surface an error to the user.
 
+/// Computes the per-loop fractional price step so that the limit ramps from ~0 % on loop 1
+/// up to `order_value_max_percent_change` by the final loop.
+///
+/// `attempt_duration / update_interval` gives the expected number of loops; clamped to at
+/// least 1 to avoid division by zero when the interval equals or exceeds the duration.
+// finddan with AI claude-sonnet-4-6
+fn price_step(
+    attempt_duration: f64,
+    update_interval: f64,
+    order_value_max_percent_change: f64,
+) -> f64 {
+    let num_loops = (attempt_duration / update_interval).max(1.0);
+    order_value_max_percent_change / num_loops
+}
+
+/// Calculates the next limit price by applying a directional percentage offset to `mid`.
+/// For buys the price is raised; for sells it is lowered.
+/// The result is rounded to two decimal places.
+// finddan with AI claude-sonnet-4-6
+fn next_limit_price(mid: f64, percent: f64, is_buy: bool) -> f64 {
+    let price = if is_buy {
+        mid * (1.0 + percent)
+    } else {
+        mid * (1.0 - percent)
+    };
+    (price * 100.0).round() / 100.0
+}
+
+/// Computes the total fill value for an order from its execution legs, or falls back to
+/// `price * quantity` if no activity data is present. Returns `None` if the value is zero.
+// finddan with AI claude-sonnet-4-6
+fn compute_fill_value(order: &model::Order, instrument: &model::InstrumentRequest) -> Option<f64> {
+    let multiplier = match instrument {
+        model::InstrumentRequest::Option { .. } => 100.0,
+        model::InstrumentRequest::Equity { .. } => 1.0,
+    };
+    if let Some(activities) = &order.order_activity_collection {
+        let total: f64 = activities
+            .iter()
+            .flat_map(|a| a.execution_legs.iter())
+            .map(|leg| leg.price * leg.quantity * multiplier)
+            .sum();
+        if total > 0.0 { Some(total) } else { None }
+    } else {
+        order.price.map(|p| p * order.quantity * multiplier)
+    }
+}
+
 /// Outcome of a [`replace_limit_order`] call.
 enum ReplaceOutcome {
     /// The order was successfully replaced; contains the new order ID if one was returned.
     Replaced(Option<i64>),
     /// The order was already filled before the replace was attempted; contains the filled order.
     AlreadyFilled(model::Order),
+    /// The order reached a non-fill terminal state (Rejected, Expired, Canceled) before the
+    /// replace was attempted. The caller should return an error without trying to cancel.
+    Terminal {
+        status: model::trader::order::Status,
+    },
 }
 
 /// Attempts to replace an existing limit order with `new_order`, but first re-checks
-/// the order's current status. If the order is already `Filled` the replace is skipped
-/// and `ReplaceOutcome::AlreadyFilled` is returned so the caller can complete successfully
-/// without treating the fill as an error.
-// finddan with AI claude-sonnet-4-6
-async fn replace_limit_order(
-    client: &Client,
-    access_token: &str,
-    account_number: &str,
-    order_id: i64,
-    new_order: model::OrderRequest,
-) -> Result<ReplaceOutcome, Error> {
-    use model::trader::order::Status as OrderStatus;
-
-    let order = GetAccountOrderRequest::new(
-        client,
-        access_token.to_string(),
-        account_number.to_string(),
-        order_id,
-    )
-    .send()
-    .await
-    .map_err(|e| Error::AutoMid(format!("Failed to check order status before replace: {e}")))?;
-
-    if order.status == OrderStatus::Filled {
-        log::info!(
-            "Order {} is already filled — skipping replace for account {}",
-            order_id,
-            account_number
-        );
-        return Ok(ReplaceOutcome::AlreadyFilled(order));
-    }
-
-    let new_id = PutAccountOrderRequest::new(
-        client,
-        access_token.to_string(),
-        account_number.to_string(),
-        order_id,
-        new_order,
-    )
-    .send()
-    .await
-    .map_err(|e| Error::AutoMid(format!("Failed to update limit price: {e}")))?;
-
-    Ok(ReplaceOutcome::Replaced(new_id))
-}
-
-/// Cancels an existing order, logging any errors without propagating them.
-// finddan with AI claude-sonnet-4-6
-async fn cancel_order(client: &Client, access_token: &str, account_number: &str, order_id: i64) {
-    match DeleteAccountOrderRequest::new(
-        client,
-        access_token.to_string(),
-        account_number.to_string(),
-        order_id,
-    )
-    .send()
-    .await
-    {
-        Ok(()) => log::info!(
-            "Cleanup: cancelled order {} for account {}",
-            order_id,
-            account_number
-        ),
-        Err(e) => log::warn!(
-            "Cleanup: failed to cancel order {} for account {}: {}",
-            order_id,
-            account_number,
-            e
-        ),
-    }
-}
-
-/// Fetches the current mid price for `symbol` by averaging the bid and ask prices.
-/// The result is truncated to two decimal places.
-// finddan with AI claude-sonnet-4-6
-async fn fetch_mid_price(client: &Client, access_token: &str, symbol: &str) -> Result<f64, Error> {
-    let quote = super::market_data::GetQuoteRequest::new(
-        client,
-        access_token.to_string(),
-        symbol.to_string(),
-    )
-    .send()
-    .await?;
-
-    let bid = quote
-        .bid_price()
-        .ok_or_else(|| Error::AutoMid(format!("no bid price available for {symbol}")))?;
-    let ask = quote
-        .ask_price()
-        .ok_or_else(|| Error::AutoMid(format!("no ask price available for {symbol}")))?;
-
-    let mid = (bid + ask) / 2.0;
-    Ok((mid * 100.0).round() / 100.0)
-}
+/// the order's current status.
+/// - If the order is already `Filled`, returns `ReplaceOutcome::AlreadyFilled` so the caller
+///   can complete successfully without treating the fill as an error.
+/// - If the order has reached any other terminal state (Rejected, Expired, Canceled), returns
+///   `ReplaceOutcome::Terminal` so the caller can bail out without issuing a spurious cancel.
+/// - Otherwise the PUT replace is issued and `ReplaceOutcome::Replaced` is returned.
+///
+/// See [`AutoMidOrderRequest::replace_limit_order`].
 
 /// Runs an auto-escalating limit order that hunts the current mid price.
 ///
@@ -1112,10 +1079,9 @@ pub struct AutoMidOrderRequest {
     client: Client,
     access_token: String,
     account_number: String,
-    symbol: String,
+    instrument: model::InstrumentRequest,
     quantity: f64,
     instruction: model::Instruction,
-    asset_type: model::AutoMidAssetType,
     /// Seconds between each price-adjustment poll.
     update_interval: f64,
     /// Fractional step applied to the current mid each loop (e.g. `0.001` = 0.1 %).
@@ -1133,10 +1099,9 @@ impl AutoMidOrderRequest {
         client: &Client,
         access_token: String,
         account_number: String,
-        symbol: String,
+        instrument: model::InstrumentRequest,
         quantity: f64,
         instruction: model::Instruction,
-        asset_type: model::AutoMidAssetType,
         update_interval: f64,
         order_value_max_percent_change: f64,
         max_attempt_duration: Option<f64>,
@@ -1146,10 +1111,9 @@ impl AutoMidOrderRequest {
             client: client.clone(),
             access_token,
             account_number,
-            symbol,
+            instrument,
             quantity,
             instruction,
-            asset_type,
             update_interval,
             order_value_max_percent_change,
             max_attempt_duration,
@@ -1158,64 +1122,41 @@ impl AutoMidOrderRequest {
     }
 
     pub async fn send(self) -> Result<model::AutoMidOrderResponse, Error> {
-        use model::trader::order::Status as OrderStatus;
-
-        let Self {
-            client,
-            access_token,
-            account_number,
-            symbol,
-            quantity,
-            instruction,
-            asset_type,
-            update_interval,
-            order_value_max_percent_change,
-            max_attempt_duration,
-            enable_market_order_conversion,
-        } = self;
-
-        let attempt_duration = max_attempt_duration.unwrap_or(60.0);
+        let attempt_duration = self.max_attempt_duration.unwrap_or(60.0);
         let attempt_limit = std::time::Duration::from_secs_f64(attempt_duration);
 
         // For buys we raise the limit over time; for sells we lower it.
         let is_buy = matches!(
-            instruction,
+            self.instruction,
             model::Instruction::Buy
                 | model::Instruction::BuyToOpen
                 | model::Instruction::BuyToClose
                 | model::Instruction::BuyToCover
         );
 
-        let make_instrument = |sym: &str| -> model::InstrumentRequest {
-            match asset_type {
-                model::AutoMidAssetType::Equity => model::InstrumentRequest::Equity {
-                    symbol: sym.to_string(),
-                },
-                model::AutoMidAssetType::Option => model::InstrumentRequest::Option {
-                    symbol: sym.to_string(),
-                },
-            }
-        };
-
         // Fetch the initial mid price and place the first order there.
-        let initial_mid = fetch_mid_price(&client, &access_token, &symbol)
+        let initial_mid = self
+            .fetch_mid_price()
             .await
             .map_err(|e| Error::AutoMid(format!("Failed to fetch initial mid price: {e}")))?;
 
         // Place the initial limit order at the current mid.
         let initial = model::OrderRequest::limit(
-            make_instrument(&symbol),
-            instruction,
-            quantity,
+            self.instrument.clone(),
+            self.instruction,
+            self.quantity,
             initial_mid,
         )?;
 
-        log::debug!("Auto mid order will create the following initial order: {:?}", initial);
+        log::debug!(
+            "Auto mid order will create the following initial order: {:?}",
+            initial
+        );
 
         let mut current_order_id = PostAccountOrderRequest::new(
-            &client,
-            access_token.clone(),
-            account_number.clone(),
+            &self.client,
+            self.access_token.clone(),
+            self.account_number.clone(),
             initial,
         )
         .send()
@@ -1225,17 +1166,17 @@ impl AutoMidOrderRequest {
         log::info!(
             "Auto-mid order {} placed for account {} at mid {:.4}",
             current_order_id,
-            account_number,
+            self.account_number,
             initial_mid
         );
 
         let start = std::time::Instant::now();
-        let interval = std::time::Duration::from_secs_f64(update_interval);
-        // Divide the total allowed percent change evenly across the expected number of
-        // loops so the offset ramps from ~0% on loop 1 up to order_value_max_percent_change
-        // by the final loop.
-        let num_loops = (attempt_duration / update_interval).max(1.0);
-        let step = order_value_max_percent_change / num_loops;
+        let interval = std::time::Duration::from_secs_f64(self.update_interval);
+        let step = price_step(
+            attempt_duration,
+            self.update_interval,
+            self.order_value_max_percent_change,
+        );
         let mut loop_count: u32 = 0;
 
         loop {
@@ -1245,159 +1186,27 @@ impl AutoMidOrderRequest {
 
             // Attempt duration elapsed — convert to market or cancel depending on config.
             if elapsed >= attempt_limit {
-                if enable_market_order_conversion {
-                    log::warn!(
-                        "Auto-mid order {} reached attempt duration for account {}, converting to market",
-                        current_order_id,
-                        account_number
-                    );
-                    let market = model::OrderRequest::market(
-                        make_instrument(&symbol),
-                        instruction,
-                        quantity,
-                    )?;
-                    let new_id = PutAccountOrderRequest::new(
-                        &client,
-                        access_token.clone(),
-                        account_number.clone(),
-                        current_order_id,
-                        market,
-                    )
-                    .send()
+                return self
+                    .handle_attempt_timeout(current_order_id, attempt_duration, loop_count)
                     .await;
-                    let new_id = match new_id {
-                        Ok(id) => id,
-                        Err(e) => {
-                            cancel_order(&client, &access_token, &account_number, current_order_id)
-                                .await;
-                            return Err(Error::AutoMid(format!(
-                                "Failed to convert order to market: {}",
-                                e
-                            )));
-                        }
-                    };
-                    log::info!(
-                        "Converted auto-mid {} to market order for account {} (new_id={:?})",
-                        current_order_id,
-                        account_number,
-                        new_id
-                    );
-                    return Ok(model::AutoMidOrderResponse {
-                        created: true,
-                        order_id: Some(new_id.unwrap_or(current_order_id) as u64),
-                        loops: loop_count,
-                        fill_value: None,
-                        market_order: true,
-                        message: Some(format!(
-                            "Converted to market order after {:.1}s",
-                            attempt_duration
-                        )),
-                    });
-                } else {
-                    log::warn!(
-                        "Auto-mid order {} reached attempt duration for account {}, cancelling",
-                        current_order_id,
-                        account_number
-                    );
-                    DeleteAccountOrderRequest::new(
-                        &client,
-                        access_token.clone(),
-                        account_number.clone(),
-                        current_order_id,
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| Error::AutoMid(format!("Failed to cancel order: {}", e)))?;
-                    return Err(Error::AutoMid(format!(
-                        "Order {} cancelled after {:.1}s attempt duration",
-                        current_order_id, attempt_duration
-                    )));
-                }
-            }
-
-            // Poll the current order status.
-            let order = match GetAccountOrderRequest::new(
-                &client,
-                access_token.clone(),
-                account_number.clone(),
-                current_order_id,
-            )
-            .send()
-            .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    cancel_order(&client, &access_token, &account_number, current_order_id).await;
-                    return Err(Error::AutoMid(format!(
-                        "Failed to poll order status: {}",
-                        e
-                    )));
-                }
-            };
-
-            match order.status {
-                OrderStatus::Filled => {
-                    log::info!(
-                        "Auto-mid order {} filled for account {}",
-                        current_order_id,
-                        account_number
-                    );
-                    let multiplier = match asset_type {
-                        model::AutoMidAssetType::Option => 100.0,
-                        model::AutoMidAssetType::Equity => 1.0,
-                    };
-                    let fill_value = if let Some(activities) = &order.order_activity_collection {
-                        let total: f64 = activities
-                            .iter()
-                            .flat_map(|a| a.execution_legs.iter())
-                            .map(|leg| leg.price * leg.quantity * multiplier)
-                            .sum();
-                        if total > 0.0 { Some(total) } else { None }
-                    } else {
-                        order.price.map(|p| p * order.quantity * multiplier)
-                    };
-                    return Ok(model::AutoMidOrderResponse {
-                        created: true,
-                        order_id: Some(current_order_id as u64),
-                        loops: loop_count,
-                        fill_value,
-                        market_order: false,
-                        message: Some("Order filled".into()),
-                    });
-                }
-                OrderStatus::Rejected | OrderStatus::Expired => {
-                    return Err(Error::AutoMid(format!(
-                        "Order {} ended with status {:?}",
-                        current_order_id, order.status
-                    )));
-                }
-                OrderStatus::Canceled => {
-                    return Err(Error::AutoMid(format!(
-                        "Order {} was unexpectedly canceled",
-                        current_order_id
-                    )));
-                }
-                _ => {} // Working, Queued, Accepted, etc.
             }
 
             // Re-fetch the live mid price to base this loop's limit price on.
-            let current_mid = match fetch_mid_price(&client, &access_token, &symbol).await {
+            let current_mid = match self.fetch_mid_price().await {
                 Ok(m) => m,
                 Err(e) => {
-                    cancel_order(&client, &access_token, &account_number, current_order_id).await;
-                    return Err(Error::AutoMid(format!("Failed to fetch mid price: {e}")));
+                    log::warn!(
+                        "Failed to fetch mid price for order {}, skipping loop: {e}",
+                        current_order_id
+                    );
+                    continue;
                 }
             };
 
             // Apply an incrementally increasing offset to the current mid:
             // loop 1 → step*1, loop 2 → step*2, … loop N → order_value_max_percent_change.
             let percent = step * f64::from(loop_count);
-            let next_price = if is_buy {
-                current_mid * (1.0 + percent)
-            } else {
-                current_mid * (1.0 - percent)
-            };
-            let next_price = (next_price * 100.0).round() / 100.0;
+            let next_price = next_limit_price(current_mid, percent, is_buy);
 
             log::info!(
                 "Auto-mid {}: mid={:.4}, percent={:.4}%, next_price={:.2}, account={}",
@@ -1405,53 +1214,25 @@ impl AutoMidOrderRequest {
                 current_mid,
                 percent * 100.0,
                 next_price,
-                account_number
+                self.account_number
             );
 
-            let adjusted = match model::OrderRequest::limit(
-                make_instrument(&symbol),
-                instruction,
-                quantity,
+            let adjusted = model::OrderRequest::limit(
+                self.instrument.clone(),
+                self.instruction,
+                self.quantity,
                 next_price,
-            ) {
-                Ok(o) => o,
-                Err(e) => {
-                    cancel_order(&client, &access_token, &account_number, current_order_id).await;
-                    return Err(e);
-                }
-            };
+            )?;
 
-            let new_id = match replace_limit_order(
-                &client,
-                &access_token,
-                &account_number,
-                current_order_id,
-                adjusted,
-            )
-            .await
-            {
+            let new_id = match self.replace_limit_order(current_order_id, adjusted).await {
                 Ok(ReplaceOutcome::Replaced(id)) => id,
                 Ok(ReplaceOutcome::AlreadyFilled(order)) => {
                     log::info!(
-                        "Auto-mid order {} filled (detected before replace) for account {}",
+                        "Auto-mid order {} filled for account {}",
                         current_order_id,
-                        account_number
+                        self.account_number
                     );
-                    let multiplier = match asset_type {
-                        model::AutoMidAssetType::Option => 100.0,
-                        model::AutoMidAssetType::Equity => 1.0,
-                    };
-                    let fill_value =
-                        if let Some(activities) = &order.order_activity_collection {
-                            let total: f64 = activities
-                                .iter()
-                                .flat_map(|a| a.execution_legs.iter())
-                                .map(|leg| leg.price * leg.quantity * multiplier)
-                                .sum();
-                            if total > 0.0 { Some(total) } else { None }
-                        } else {
-                            order.price.map(|p| p * order.quantity * multiplier)
-                        };
+                    let fill_value = compute_fill_value(&order, &self.instrument);
                     return Ok(model::AutoMidOrderResponse {
                         created: true,
                         order_id: Some(current_order_id as u64),
@@ -1461,9 +1242,14 @@ impl AutoMidOrderRequest {
                         message: Some("Order filled".into()),
                     });
                 }
+                Ok(ReplaceOutcome::Terminal { status }) => {
+                    return Err(Error::AutoMid(format!(
+                        "Order {} ended with terminal status {:?} before replace",
+                        current_order_id, status
+                    )));
+                }
                 Err(e) => {
-                    cancel_order(&client, &access_token, &account_number, current_order_id)
-                        .await;
+                    self.cancel_order(current_order_id).await;
                     return Err(e);
                 }
             };
@@ -1476,8 +1262,205 @@ impl AutoMidOrderRequest {
                 "Updated auto-mid {} to price {:.2} for account {}",
                 current_order_id,
                 next_price,
-                account_number
+                self.account_number
             );
+        }
+    }
+
+    /// Cancels an existing order, logging any errors without propagating them.
+    // finddan with AI claude-sonnet-4-6
+    async fn cancel_order(&self, order_id: i64) {
+        match DeleteAccountOrderRequest::new(
+            &self.client,
+            self.access_token.to_string(),
+            self.account_number.to_string(),
+            order_id,
+        )
+        .send()
+        .await
+        {
+            Ok(()) => log::info!(
+                "Cleanup: cancelled order {} for account {}",
+                order_id,
+                self.account_number
+            ),
+            Err(e) => log::warn!(
+                "Cleanup: failed to cancel order {} for account {}: {}",
+                order_id,
+                self.account_number,
+                e
+            ),
+        }
+    }
+
+    /// Fetches the current mid price for the instrument by averaging bid and ask.
+    /// The result is rounded to two decimal places.
+    // finddan with AI claude-sonnet-4-6
+    async fn fetch_mid_price(&self) -> Result<f64, Error> {
+        let symbol = self.instrument.symbol();
+        let quote = super::market_data::GetQuoteRequest::new(
+            &self.client,
+            self.access_token.to_string(),
+            symbol.to_string(),
+        )
+        .send()
+        .await?;
+
+        let bid = quote
+            .bid_price()
+            .ok_or_else(|| Error::AutoMid(format!("no bid price available for {symbol}")))?;
+        let ask = quote
+            .ask_price()
+            .ok_or_else(|| Error::AutoMid(format!("no ask price available for {symbol}")))?;
+
+        let mid = (bid + ask) / 2.0;
+        Ok((mid * 100.0).round() / 100.0)
+    }
+
+    /// Attempts to replace an existing limit order with `new_order`, but first re-checks
+    /// the order's current status.
+    /// - If the order is already `Filled`, returns `ReplaceOutcome::AlreadyFilled`.
+    /// - If the order has reached any other terminal state (Rejected, Expired, Canceled),
+    ///   returns `ReplaceOutcome::Terminal`.
+    /// - Otherwise the PUT replace is issued and `ReplaceOutcome::Replaced` is returned.
+    // finddan with AI claude-sonnet-4-6
+    async fn replace_limit_order(
+        &self,
+        order_id: i64,
+        new_order: model::OrderRequest,
+    ) -> Result<ReplaceOutcome, Error> {
+        use model::trader::order::Status as OrderStatus;
+
+        let order = GetAccountOrderRequest::new(
+            &self.client,
+            self.access_token.to_string(),
+            self.account_number.to_string(),
+            order_id,
+        )
+        .send()
+        .await
+        .map_err(|e| Error::AutoMid(format!("Failed to check order status before replace: {e}")))?;
+
+        match order.status {
+            OrderStatus::Filled => {
+                log::info!(
+                    "Order {} is already filled — skipping replace for account {}",
+                    order_id,
+                    self.account_number
+                );
+                return Ok(ReplaceOutcome::AlreadyFilled(order));
+            }
+            OrderStatus::Rejected | OrderStatus::Expired | OrderStatus::Canceled => {
+                log::warn!(
+                    "Order {} reached terminal status {:?} before replace for account {}",
+                    order_id,
+                    order.status,
+                    self.account_number
+                );
+                let status = order.status;
+                return Ok(ReplaceOutcome::Terminal { status });
+            }
+            _ => {}
+        }
+
+        let new_id = PutAccountOrderRequest::new(
+            &self.client,
+            self.access_token.to_string(),
+            self.account_number.to_string(),
+            order_id,
+            new_order,
+        )
+        .send()
+        .await
+        .map_err(|e| Error::AutoMid(format!("Failed to update limit price: {e}")))?;
+
+        Ok(ReplaceOutcome::Replaced(new_id))
+    }
+
+    /// Handles the case where `max_attempt_duration` has elapsed.
+    /// - When `enable_market_order_conversion` is `true`, attempts to convert the open limit
+    ///   order to a market order via [`replace_limit_order`], handling fill and terminal states
+    ///   correctly.
+    /// - When `false`, cancels the order and returns an error.
+    // finddan with AI claude-sonnet-4-6
+    async fn handle_attempt_timeout(
+        &self,
+        current_order_id: i64,
+        attempt_duration: f64,
+        loop_count: u32,
+    ) -> Result<model::AutoMidOrderResponse, Error> {
+        if self.enable_market_order_conversion {
+            log::warn!(
+                "Auto-mid order {} reached attempt duration for account {}, converting to market",
+                current_order_id,
+                self.account_number
+            );
+            let market = model::OrderRequest::market(
+                self.instrument.clone(),
+                self.instruction,
+                self.quantity,
+            )?;
+
+            match self.replace_limit_order(current_order_id, market).await? {
+                ReplaceOutcome::Replaced(new_id) => {
+                    log::info!(
+                        "Converted auto-mid {} to market order for account {} (new_id={:?})",
+                        current_order_id,
+                        self.account_number,
+                        new_id
+                    );
+                    Ok(model::AutoMidOrderResponse {
+                        created: true,
+                        order_id: Some(new_id.unwrap_or(current_order_id) as u64),
+                        loops: loop_count,
+                        fill_value: None,
+                        market_order: true,
+                        message: Some(format!(
+                            "Converted to market order after {:.1}s",
+                            attempt_duration
+                        )),
+                    })
+                }
+                ReplaceOutcome::AlreadyFilled(order) => {
+                    log::info!(
+                        "Auto-mid order {} filled for account {} (detected during market conversion)",
+                        current_order_id,
+                        self.account_number
+                    );
+                    let fill_value = compute_fill_value(&order, &self.instrument);
+                    Ok(model::AutoMidOrderResponse {
+                        created: true,
+                        order_id: Some(current_order_id as u64),
+                        loops: loop_count,
+                        fill_value,
+                        market_order: false,
+                        message: Some("Order filled".into()),
+                    })
+                }
+                ReplaceOutcome::Terminal { status } => Err(Error::AutoMid(format!(
+                    "Order {} ended with terminal status {:?} during market conversion",
+                    current_order_id, status
+                ))),
+            }
+        } else {
+            log::warn!(
+                "Auto-mid order {} reached attempt duration for account {}, cancelling",
+                current_order_id,
+                self.account_number
+            );
+            DeleteAccountOrderRequest::new(
+                &self.client,
+                self.access_token.clone(),
+                self.account_number.clone(),
+                current_order_id,
+            )
+            .send()
+            .await
+            .map_err(|e| Error::AutoMid(format!("Failed to cancel order: {}", e)))?;
+            Err(Error::AutoMid(format!(
+                "Order {} cancelled after {:.1}s attempt duration",
+                current_order_id, attempt_duration
+            )))
         }
     }
 }

@@ -323,6 +323,15 @@ impl From<InstrumentResponse> for InstrumentRequest {
     }
 }
 
+impl InstrumentRequest {
+    /// Returns the symbol string regardless of asset type.
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::Equity { symbol } | Self::Option { symbol } => symbol,
+        }
+    }
+}
+
 /// Which asset class to trade in an auto-mid order.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
