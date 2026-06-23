@@ -1304,6 +1304,7 @@ impl AutoMidOrderRequest {
     // finddan with AI claude-sonnet-4-6
     async fn fetch_mid_price(&self) -> Result<f64, Error> {
         let symbol = self.instrument.symbol();
+        let fetch_start = std::time::Instant::now();
         let quote = super::market_data::GetQuoteRequest::new(
             &self.client,
             self.access_token.to_string(),
@@ -1311,6 +1312,11 @@ impl AutoMidOrderRequest {
         )
         .send()
         .await?;
+        log::debug!(
+            "fetch_mid_price: fetched quote for {} in {:.0}ms",
+            symbol,
+            fetch_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         let bid = quote
             .bid_price()
@@ -1337,6 +1343,7 @@ impl AutoMidOrderRequest {
     ) -> Result<ReplaceOutcome, Error> {
         use model::trader::order::Status as OrderStatus;
 
+        let fetch_start = std::time::Instant::now();
         let order = GetAccountOrderRequest::new(
             &self.client,
             self.access_token.to_string(),
@@ -1346,6 +1353,12 @@ impl AutoMidOrderRequest {
         .send()
         .await
         .map_err(|e| Error::AutoMid(format!("Failed to check order status before replace: {e}")))?;
+        log::debug!(
+            "replace_limit_order: fetched order {} status={:?} in {:.0}ms",
+            order_id,
+            order.status,
+            fetch_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         match order.status {
             OrderStatus::Filled => {
