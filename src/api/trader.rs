@@ -1326,7 +1326,12 @@ impl AutoMidOrderRequest {
             .ok_or_else(|| Error::AutoMid(format!("no ask price available for {symbol}")))?;
 
         let mid = (bid + ask) / 2.0;
-        Ok((mid * 100.0).round() / 100.0)
+        let mid_rounded = (mid * 100.0).round() / 100.0;
+        log::debug!(
+            "fetch_mid_price: {} bid={:.4} ask={:.4} mid={:.4}",
+            symbol, bid, ask, mid_rounded
+        );
+        Ok(mid_rounded)
     }
 
     /// Attempts to replace an existing limit order with `new_order`, but first re-checks
