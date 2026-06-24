@@ -1253,6 +1253,49 @@ impl AutoMidOrderRequest {
                     });
                 }
                 Ok(ReplaceOutcome::Terminal { status }) => {
+                    // A Rejected status can be a race condition where the order filled
+                    // in the brief window between the status check and the PUT replace.
+                    // Re-fetch the order to confirm before treating it as an error.
+                    use model::trader::order::Status as OrderStatus;
+                    if status == OrderStatus::Rejected {
+                        match GetAccountOrderRequest::new(
+                            &self.client,
+                            self.access_token.clone(),
+                            self.account_number.clone(),
+                            current_order_id,
+                        )
+                        .send()
+                        .await
+                        {
+                            Ok(order) if order.status == OrderStatus::Filled => {
+                                log::info!(
+                                    "Auto-mid order {} was Rejected but re-fetch shows Filled — treating as fill",
+                                    current_order_id
+                                );
+                                let fill_value = compute_fill_value(&order, &self.instrument);
+                                return Ok(model::AutoMidOrderResponse {
+                                    created: true,
+                                    order_id: Some(current_order_id as u64),
+                                    loops: loop_count,
+                                    fill_value,
+                                    market_order: false,
+                                    message: Some("Order filled (rejected race)".into()),
+                                });
+                            }
+                            Ok(order) => {
+                                log::warn!(
+                                    "Auto-mid order {} re-fetched after Rejected, status={:?}",
+                                    current_order_id, order.status
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "Auto-mid order {} could not be re-fetched after Rejected: {}",
+                                    current_order_id, e
+                                );
+                            }
+                        }
+                    }
                     return Err(Error::AutoMid(format!(
                         "Order {} ended with terminal status {:?} before replace",
                         current_order_id, status
