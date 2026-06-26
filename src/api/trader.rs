@@ -1129,7 +1129,7 @@ impl AutoMidOrderRequest {
         log::info!(
             "Auto-mid starting: instrument={:?}, quantity={}, instruction={:?}, \
              update_interval={:.1}s, max_percent_change={:.1}%, attempt_duration={:.1}s, market_conversion={}",
-            self.instrument,
+            self.instrument.symbol(),
             self.quantity,
             self.instruction,
             self.update_interval,
@@ -1177,7 +1177,8 @@ impl AutoMidOrderRequest {
         .ok_or_else(|| Error::AutoMid("No order ID returned for limit order".into()))?;
 
         log::info!(
-            "Auto-mid order {} placed at mid {:.4}",
+            "Auto-mid for {} order {} placed at mid {:.4}",
+            self.instrument.symbol(),
             current_order_id,
             initial_quote.mid
         );
@@ -1218,10 +1219,17 @@ impl AutoMidOrderRequest {
             // Apply an incrementally increasing offset to the current mid,
             // clamped so the price never crosses the live bid/ask spread.
             let percent = step * f64::from(loop_count);
-            let next_price = next_limit_price(current_quote.mid, percent, is_buy, current_quote.bid, current_quote.ask);
+            let next_price = next_limit_price(
+                current_quote.mid,
+                percent,
+                is_buy,
+                current_quote.bid,
+                current_quote.ask,
+            );
 
             log::info!(
-                "Auto-mid {}: mid={:.4}, percent={:.4}%, order_price={:.2}",
+                "Next auto-mid request for {} order {}: mid={:.4}, percent={:.4}%, order_price={:.2}",
+                self.instrument.symbol(),
                 current_order_id,
                 current_quote.mid,
                 percent * 100.0,
@@ -1238,10 +1246,7 @@ impl AutoMidOrderRequest {
             let new_id = match self.replace_limit_order(current_order_id, adjusted).await {
                 Ok(ReplaceOutcome::Replaced(id)) => id,
                 Ok(ReplaceOutcome::AlreadyFilled(order)) => {
-                    log::info!(
-                        "Auto-mid order {} filled",
-                        current_order_id
-                    );
+                    log::info!("Auto-mid order {} filled", current_order_id);
                     let fill_value = compute_fill_value(&order, &self.instrument);
                     return Ok(model::AutoMidOrderResponse {
                         created: true,
@@ -1285,13 +1290,15 @@ impl AutoMidOrderRequest {
                             Ok(order) => {
                                 log::warn!(
                                     "Auto-mid order {} re-fetched after Rejected, status={:?}",
-                                    current_order_id, order.status
+                                    current_order_id,
+                                    order.status
                                 );
                             }
                             Err(e) => {
                                 log::warn!(
                                     "Auto-mid order {} could not be re-fetched after Rejected: {}",
-                                    current_order_id, e
+                                    current_order_id,
+                                    e
                                 );
                             }
                         }
@@ -1331,15 +1338,8 @@ impl AutoMidOrderRequest {
         .send()
         .await
         {
-            Ok(()) => log::info!(
-                "Cleanup: cancelled order {}",
-                order_id
-            ),
-            Err(e) => log::warn!(
-                "Cleanup: failed to cancel order {}: {}",
-                order_id,
-                e
-            ),
+            Ok(()) => log::info!("Cleanup: cancelled order {}", order_id),
+            Err(e) => log::warn!("Cleanup: failed to cancel order {}: {}", order_id, e),
         }
     }
 
@@ -1373,9 +1373,16 @@ impl AutoMidOrderRequest {
         let mid_rounded = (mid * 100.0).round() / 100.0;
         log::debug!(
             "fetch_mid_price: {} bid={:.4} ask={:.4} mid={:.4}",
-            symbol, bid, ask, mid_rounded
+            symbol,
+            bid,
+            ask,
+            mid_rounded
         );
-        Ok(MidPrice { bid, ask, mid: mid_rounded })
+        Ok(MidPrice {
+            bid,
+            ask,
+            mid: mid_rounded,
+        })
     }
 
     /// Attempts to replace an existing limit order with `new_order`, but first re-checks
@@ -1411,10 +1418,7 @@ impl AutoMidOrderRequest {
 
         match order.status {
             OrderStatus::Filled => {
-                log::info!(
-                    "Order {} is already filled — skipping replace",
-                    order_id
-                );
+                log::info!("Order {} is already filled — skipping replace", order_id);
                 return Ok(ReplaceOutcome::AlreadyFilled(order));
             }
             OrderStatus::Rejected | OrderStatus::Expired | OrderStatus::Canceled => {
