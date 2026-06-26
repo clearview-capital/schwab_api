@@ -1481,7 +1481,7 @@ impl AutoMidOrderRequest {
         }
 
         let put_start = std::time::Instant::now();
-        let new_id = PutAccountOrderRequest::new(
+        let put_result = PutAccountOrderRequest::new(
             &self.client,
             self.access_token.to_string(),
             self.account_number.to_string(),
@@ -1489,16 +1489,58 @@ impl AutoMidOrderRequest {
             new_order,
         )
         .send()
-        .await
-        .map_err(|e| Error::AutoMid(format!("Failed to update limit price: {e}")))?;
+        .await;
         log::info!(
-            "replace_limit_order: PUT order {} completed in {:.0}ms (new_id={:?})",
+            "replace_limit_order: PUT order {} completed in {:.0}ms",
             order_id,
-            put_start.elapsed().as_secs_f64() * 1000.0,
-            new_id
+            put_start.elapsed().as_secs_f64() * 1000.0
         );
 
-        Ok(ReplaceOutcome::Replaced(new_id))
+        match put_result {
+            Ok(new_id) => {
+                log::info!(
+                    "replace_limit_order: order {} replaced (new_id={:?})",
+                    order_id,
+                    new_id
+                );
+                Ok(ReplaceOutcome::Replaced(new_id))
+            }
+            Err(put_err) => {
+                // The PUT can be rejected because the order filled in the brief window
+                // between the pre-replace status check and the actual PUT.  Re-fetch to
+                // confirm before surfacing an error.
+                log::warn!(
+                    "replace_limit_order: PUT for order {} failed: {} — re-fetching to check if filled",
+                    order_id,
+                    put_err
+                );
+                match self.fetch_order_status(order_id).await {
+                    Ok(order) if order.status == OrderStatus::Filled => {
+                        log::info!(
+                            "replace_limit_order: order {} is Filled after PUT failure — treating as fill",
+                            order_id
+                        );
+                        Ok(ReplaceOutcome::AlreadyFilled(order))
+                    }
+                    Ok(order) => {
+                        log::warn!(
+                            "replace_limit_order: order {} re-fetched after PUT failure — status={:?}",
+                            order_id,
+                            order.status
+                        );
+                        Err(put_err)
+                    }
+                    Err(fetch_err) => {
+                        log::warn!(
+                            "replace_limit_order: could not re-fetch order {} after PUT failure: {}",
+                            order_id,
+                            fetch_err
+                        );
+                        Err(put_err)
+                    }
+                }
+            }
+        }
     }
 
     /// Handles the case where `max_attempt_duration` has elapsed.
