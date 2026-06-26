@@ -1166,6 +1166,7 @@ impl AutoMidOrderRequest {
             initial
         );
 
+        let place_start = std::time::Instant::now();
         let mut current_order_id = PostAccountOrderRequest::new(
             &self.client,
             self.access_token.clone(),
@@ -1175,12 +1176,12 @@ impl AutoMidOrderRequest {
         .send()
         .await?
         .ok_or_else(|| Error::AutoMid("No order ID returned for limit order".into()))?;
-
         log::info!(
-            "Auto-mid for {} order {} placed at mid {:.4}",
+            "Auto-mid for {} initial order {} placed at mid {:.4} in {:.0}ms",
             self.instrument.symbol(),
             current_order_id,
-            initial_quote.mid
+            initial_quote.mid,
+            place_start.elapsed().as_secs_f64() * 1000.0
         );
 
         let start = std::time::Instant::now();
@@ -1263,15 +1264,7 @@ impl AutoMidOrderRequest {
                     // Re-fetch the order to confirm before treating it as an error.
                     use model::trader::order::Status as OrderStatus;
                     if status == OrderStatus::Rejected {
-                        match GetAccountOrderRequest::new(
-                            &self.client,
-                            self.access_token.clone(),
-                            self.account_number.clone(),
-                            current_order_id,
-                        )
-                        .send()
-                        .await
-                        {
+                        match self.fetch_order_status(current_order_id).await {
                             Ok(order) if order.status == OrderStatus::Filled => {
                                 log::info!(
                                     "Auto-mid order {} was Rejected but re-fetch shows Filled — treating as fill",
@@ -1289,7 +1282,7 @@ impl AutoMidOrderRequest {
                             }
                             Ok(order) => {
                                 log::warn!(
-                                    "Auto-mid order {} re-fetched after Rejected, status={:?}",
+                                    "Auto-mid order {} re-fetched after Rejected — status={:?}",
                                     current_order_id,
                                     order.status
                                 );
@@ -1327,8 +1320,15 @@ impl AutoMidOrderRequest {
     }
 
     /// Cancels an existing order, logging any errors without propagating them.
+    /// If the DELETE request fails, the order is re-fetched to check whether it was
+    /// already filled — a filled order is logged at `info` rather than `warn` since
+    /// the position has been satisfied. Any other terminal status is logged at `warn`.
+    /// Emits an `info` log with the elapsed time for the cancel call.
     // finddan with AI claude-sonnet-4-6
     async fn cancel_order(&self, order_id: i64) {
+        use model::trader::order::Status as OrderStatus;
+
+        let cancel_start = std::time::Instant::now();
         match DeleteAccountOrderRequest::new(
             &self.client,
             self.access_token.to_string(),
@@ -1338,9 +1338,71 @@ impl AutoMidOrderRequest {
         .send()
         .await
         {
-            Ok(()) => log::info!("Cleanup: cancelled order {}", order_id),
-            Err(e) => log::warn!("Cleanup: failed to cancel order {}: {}", order_id, e),
+            Ok(()) => log::info!(
+                "Cleanup: cancelled order {} in {:.0}ms",
+                order_id,
+                cancel_start.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(delete_err) => {
+                log::warn!(
+                    "Cleanup: DELETE for order {} failed ({:.0}ms): {} — re-fetching to check status",
+                    order_id,
+                    cancel_start.elapsed().as_secs_f64() * 1000.0,
+                    delete_err
+                );
+
+                // Re-fetch the order to determine whether the cancel failure was because
+                // the order had already filled (benign) or some other reason.
+                match self.fetch_order_status(order_id).await {
+                    Ok(order) if order.status == OrderStatus::Filled => {
+                        log::info!(
+                            "Cleanup: order {} re-fetched after cancel failure — status=Filled, position satisfied",
+                            order_id
+                        );
+                    }
+                    Ok(order) => {
+                        log::warn!(
+                            "Cleanup: order {} re-fetched after cancel failure — status={:?}",
+                            order_id,
+                            order.status
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Cleanup: could not re-fetch order {} after cancel failure: {}",
+                            order_id,
+                            e
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    /// Fetches the current state of an order by ID, timing the network call and emitting
+    /// an `info` log with the elapsed duration and resolved status.
+    // finddan with AI claude-sonnet-4-6
+    async fn fetch_order_status(
+        &self,
+        order_id: i64,
+    ) -> Result<model::trader::order::Order, Error> {
+        let fetch_start = std::time::Instant::now();
+        let order = GetAccountOrderRequest::new(
+            &self.client,
+            self.access_token.to_string(),
+            self.account_number.to_string(),
+            order_id,
+        )
+        .send()
+        .await
+        .map_err(|e| Error::AutoMid(format!("Failed to fetch order {order_id} status: {e}")))?;
+        log::info!(
+            "fetch_order_status: order {} status={:?} in {:.0}ms",
+            order_id,
+            order.status,
+            fetch_start.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(order)
     }
 
     /// Fetches the current mid price for the instrument by averaging bid and ask.
@@ -1356,7 +1418,7 @@ impl AutoMidOrderRequest {
         )
         .send()
         .await?;
-        log::debug!(
+        log::info!(
             "fetch_mid_price: fetched quote for {} in {:.0}ms",
             symbol,
             fetch_start.elapsed().as_secs_f64() * 1000.0
@@ -1386,7 +1448,7 @@ impl AutoMidOrderRequest {
     }
 
     /// Attempts to replace an existing limit order with `new_order`, but first re-checks
-    /// the order's current status.
+    /// the order's current status via [`fetch_order_status`].
     /// - If the order is already `Filled`, returns `ReplaceOutcome::AlreadyFilled`.
     /// - If the order has reached any other terminal state (Rejected, Expired, Canceled),
     ///   returns `ReplaceOutcome::Terminal`.
@@ -1399,22 +1461,7 @@ impl AutoMidOrderRequest {
     ) -> Result<ReplaceOutcome, Error> {
         use model::trader::order::Status as OrderStatus;
 
-        let fetch_start = std::time::Instant::now();
-        let order = GetAccountOrderRequest::new(
-            &self.client,
-            self.access_token.to_string(),
-            self.account_number.to_string(),
-            order_id,
-        )
-        .send()
-        .await
-        .map_err(|e| Error::AutoMid(format!("Failed to check order status before replace: {e}")))?;
-        log::debug!(
-            "replace_limit_order: fetched order {} status={:?} in {:.0}ms",
-            order_id,
-            order.status,
-            fetch_start.elapsed().as_secs_f64() * 1000.0
-        );
+        let order = self.fetch_order_status(order_id).await?;
 
         match order.status {
             OrderStatus::Filled => {
@@ -1433,6 +1480,7 @@ impl AutoMidOrderRequest {
             _ => {}
         }
 
+        let put_start = std::time::Instant::now();
         let new_id = PutAccountOrderRequest::new(
             &self.client,
             self.access_token.to_string(),
@@ -1443,6 +1491,12 @@ impl AutoMidOrderRequest {
         .send()
         .await
         .map_err(|e| Error::AutoMid(format!("Failed to update limit price: {e}")))?;
+        log::info!(
+            "replace_limit_order: PUT order {} completed in {:.0}ms (new_id={:?})",
+            order_id,
+            put_start.elapsed().as_secs_f64() * 1000.0,
+            new_id
+        );
 
         Ok(ReplaceOutcome::Replaced(new_id))
     }
@@ -1514,6 +1568,7 @@ impl AutoMidOrderRequest {
                 "Auto-mid order {} reached attempt duration, cancelling",
                 current_order_id
             );
+            let timeout_cancel_start = std::time::Instant::now();
             DeleteAccountOrderRequest::new(
                 &self.client,
                 self.access_token.clone(),
@@ -1523,6 +1578,11 @@ impl AutoMidOrderRequest {
             .send()
             .await
             .map_err(|e| Error::AutoMid(format!("Failed to cancel order: {}", e)))?;
+            log::info!(
+                "handle_attempt_timeout: cancelled order {} in {:.0}ms",
+                current_order_id,
+                timeout_cancel_start.elapsed().as_secs_f64() * 1000.0
+            );
             Err(Error::AutoMid(format!(
                 "Order {} cancelled after {:.1}s attempt duration",
                 current_order_id, attempt_duration
