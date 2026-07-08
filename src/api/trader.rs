@@ -1038,28 +1038,41 @@ fn compute_fill_value(order: &model::Order, instrument: &model::InstrumentReques
     }
 }
 
-/// Outcome of a [`replace_limit_order`] call.
-enum ReplaceOutcome {
-    /// The order was successfully replaced; contains the new order ID if one was returned.
-    Replaced(Option<i64>),
-    /// The order was already filled before the replace was attempted; contains the filled order.
-    AlreadyFilled(model::Order),
-    /// The order reached a non-fill terminal state (Rejected, Expired, Canceled) before the
-    /// replace was attempted. The caller should return an error without trying to cancel.
+/// How an order should be submitted to the broker in [`AutoMidOrderRequest::submit_order`].
+enum Submission {
+    /// A brand-new order placed via `POST`. It has no predecessor in the replacement chain.
+    New,
+    /// A replacement of an existing order placed via `PUT`. Retains the id of the order being
+    /// replaced so a race-window fill on it can be detected if the replacement is rejected.
+    Replace {
+        /// The id of the order this submission replaces.
+        previous_order_id: i64,
+    },
+}
+
+/// Durable outcome of submitting (creating or replacing) an order, after any rejection has been
+/// validated against the replacement chain by [`AutoMidOrderRequest::resolve_order`].
+enum OrderOutcome {
+    /// The order is live and working in the market. Holds the active order id.
+    Live(i64),
+    /// An order in the chain filled — possibly the predecessor, during a replace race. Holds the
+    /// filled order so its real id and fill value can be reported.
+    Filled(model::Order),
+    /// The chain reached a genuine, non-fill terminal state (Rejected, Canceled, Expired).
     Terminal {
+        /// The id of the order that reached the terminal state.
+        order_id: i64,
+        /// The terminal status the order settled into.
         status: model::trader::order::Status,
     },
 }
 
-/// Attempts to replace an existing limit order with `new_order`, but first re-checks
-/// the order's current status.
-/// - If the order is already `Filled`, returns `ReplaceOutcome::AlreadyFilled` so the caller
-///   can complete successfully without treating the fill as an error.
-/// - If the order has reached any other terminal state (Rejected, Expired, Canceled), returns
-///   `ReplaceOutcome::Terminal` so the caller can bail out without issuing a spurious cancel.
-/// - Otherwise the PUT replace is issued and `ReplaceOutcome::Replaced` is returned.
-///
-/// See [`AutoMidOrderRequest::replace_limit_order`].
+/// Maximum number of times [`AutoMidOrderRequest::resolve_order`] re-fetches an order while it
+/// sits in a transitional state (e.g. `PendingReplace`) before treating it as terminal.
+const MAX_RESOLVE_ATTEMPTS: u32 = 3;
+
+/// Delay between transitional-state re-fetches in [`AutoMidOrderRequest::resolve_order`].
+const RESOLVE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Runs an auto-escalating limit order that hunts the current mid price.
 ///
@@ -1166,16 +1179,21 @@ impl AutoMidOrderRequest {
             initial
         );
 
+        // Place the initial limit order and validate it landed in a live state.
         let place_start = std::time::Instant::now();
-        let mut current_order_id = PostAccountOrderRequest::new(
-            &self.client,
-            self.access_token.clone(),
-            self.account_number.clone(),
-            initial,
-        )
-        .send()
-        .await?
-        .ok_or_else(|| Error::AutoMid("No order ID returned for limit order".into()))?;
+        let mut current_order_id = match self.submit_order(initial, Submission::New).await? {
+            OrderOutcome::Live(id) => id,
+            OrderOutcome::Filled(order) => {
+                log::info!("Auto-mid initial order {} filled immediately", order.order_id);
+                return Ok(self.fill_response(&order, 0, "Order filled"));
+            }
+            OrderOutcome::Terminal { order_id, status } => {
+                return Err(Error::AutoMid(format!(
+                    "Initial order {} ended with terminal status {:?}",
+                    order_id, status
+                )));
+            }
+        };
         log::info!(
             "Auto-mid for {} initial order {} placed at mid {:.4} in {:.0}ms",
             self.instrument.symbol(),
@@ -1244,78 +1262,41 @@ impl AutoMidOrderRequest {
                 next_price,
             )?;
 
-            let new_id = match self.replace_limit_order(current_order_id, adjusted).await {
-                Ok(ReplaceOutcome::Replaced(id)) => id,
-                Ok(ReplaceOutcome::AlreadyFilled(order)) => {
-                    log::info!("Auto-mid order {} filled", current_order_id);
-                    let fill_value = compute_fill_value(&order, &self.instrument);
-                    return Ok(model::AutoMidOrderResponse {
-                        created: true,
-                        order_id: Some(current_order_id as u64),
-                        loops: loop_count,
-                        fill_value,
-                        market_order: false,
-                        message: Some("Order filled".into()),
-                    });
+            // Replace the working order. `submit_order` validates any rejection against the
+            // order being replaced, so a race-window fill is reported as a success rather
+            // than surfaced as a spurious error.
+            match self
+                .submit_order(
+                    adjusted,
+                    Submission::Replace {
+                        previous_order_id: current_order_id,
+                    },
+                )
+                .await
+            {
+                Ok(OrderOutcome::Live(new_id)) => {
+                    current_order_id = new_id;
+                    log::info!(
+                        "Updated auto-mid {} to price {:.2}",
+                        current_order_id,
+                        next_price
+                    );
                 }
-                Ok(ReplaceOutcome::Terminal { status }) => {
-                    // A Rejected status can be a race condition where the order filled
-                    // in the brief window between the status check and the PUT replace.
-                    // Re-fetch the order to confirm before treating it as an error.
-                    use model::trader::order::Status as OrderStatus;
-                    if status == OrderStatus::Rejected {
-                        match self.fetch_order_status(current_order_id).await {
-                            Ok(order) if order.status == OrderStatus::Filled => {
-                                log::info!(
-                                    "Auto-mid order {} was Rejected but re-fetch shows Filled — treating as fill",
-                                    current_order_id
-                                );
-                                let fill_value = compute_fill_value(&order, &self.instrument);
-                                return Ok(model::AutoMidOrderResponse {
-                                    created: true,
-                                    order_id: Some(current_order_id as u64),
-                                    loops: loop_count,
-                                    fill_value,
-                                    market_order: false,
-                                    message: Some("Order filled (rejected race)".into()),
-                                });
-                            }
-                            Ok(order) => {
-                                log::warn!(
-                                    "Auto-mid order {} re-fetched after Rejected — status={:?}",
-                                    current_order_id,
-                                    order.status
-                                );
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "Auto-mid order {} could not be re-fetched after Rejected: {}",
-                                    current_order_id,
-                                    e
-                                );
-                            }
-                        }
-                    }
+                Ok(OrderOutcome::Filled(order)) => {
+                    log::info!("Auto-mid order {} filled", order.order_id);
+                    return Ok(self.fill_response(&order, loop_count, "Order filled"));
+                }
+                Ok(OrderOutcome::Terminal { order_id, status }) => {
                     return Err(Error::AutoMid(format!(
                         "Order {} ended with terminal status {:?} before replace",
-                        current_order_id, status
+                        order_id, status
                     )));
                 }
                 Err(e) => {
                     self.cancel_order(current_order_id).await;
                     return Err(e);
                 }
-            };
-
-            if let Some(new_id) = new_id {
-                current_order_id = new_id;
             }
-
-            log::info!(
-                "Updated auto-mid {} to price {:.2}",
-                current_order_id,
-                next_price
-            );
         }
     }
 
@@ -1447,108 +1428,203 @@ impl AutoMidOrderRequest {
         })
     }
 
-    /// Attempts to replace an existing limit order with `new_order`, but first re-checks
-    /// the order's current status via [`fetch_order_status`].
-    /// - If the order is already `Filled`, returns `ReplaceOutcome::AlreadyFilled`.
-    /// - If the order has reached any other terminal state (Rejected, Expired, Canceled),
-    ///   returns `ReplaceOutcome::Terminal`.
-    /// - Otherwise the PUT replace is issued and `ReplaceOutcome::Replaced` is returned.
-    // finddan with AI claude-sonnet-4-6
-    async fn replace_limit_order(
+    /// Builds a successful [`model::AutoMidOrderResponse`] for a filled order, using the order's
+    /// own id and computed fill value. `loops` is the number of polling loops that ran.
+    // finddan with AI claude-opus-4-6
+    fn fill_response(
+        &self,
+        order: &model::Order,
+        loops: u32,
+        message: &str,
+    ) -> model::AutoMidOrderResponse {
+        model::AutoMidOrderResponse {
+            created: true,
+            order_id: Some(order.order_id as u64),
+            loops,
+            fill_value: compute_fill_value(order, &self.instrument),
+            market_order: false,
+            message: Some(message.into()),
+        }
+    }
+
+    /// Submits an order to the broker — a fresh `POST` for [`Submission::New`] or a `PUT`
+    /// replacement for [`Submission::Replace`] — and resolves the result into a durable
+    /// [`OrderOutcome`].
+    ///
+    /// This is the single entry point for every order create/replace in an auto-mid run. Its
+    /// durability guarantee is that a `Rejected` result is never taken at face value: a
+    /// replacement is frequently rejected precisely because the order it replaced filled in the
+    /// race window between the pre-replace state and the `PUT` reaching the broker. In that case
+    /// the replaced order is re-checked (see [`AutoMidOrderRequest::resolve_order`]) and, if
+    /// filled, the outcome is reported as [`OrderOutcome::Filled`] rather than surfaced as an error.
+    // finddan with AI claude-opus-4-6
+    async fn submit_order(
+        &self,
+        order: model::OrderRequest,
+        submission: Submission,
+    ) -> Result<OrderOutcome, Error> {
+        let submit_start = std::time::Instant::now();
+        let (order_id, predecessor_id) = match submission {
+            Submission::New => {
+                let id = PostAccountOrderRequest::new(
+                    &self.client,
+                    self.access_token.clone(),
+                    self.account_number.clone(),
+                    order,
+                )
+                .send()
+                .await?
+                .ok_or_else(|| Error::AutoMid("No order ID returned for limit order".into()))?;
+                log::info!(
+                    "submit_order: POST created order {} in {:.0}ms",
+                    id,
+                    submit_start.elapsed().as_secs_f64() * 1000.0
+                );
+                (id, None)
+            }
+            Submission::Replace { previous_order_id } => {
+                match PutAccountOrderRequest::new(
+                    &self.client,
+                    self.access_token.clone(),
+                    self.account_number.clone(),
+                    previous_order_id,
+                    order,
+                )
+                .send()
+                .await
+                {
+                    Ok(new_id) => {
+                        let id = new_id.unwrap_or(previous_order_id);
+                        log::info!(
+                            "submit_order: PUT replaced order {} with {} in {:.0}ms",
+                            previous_order_id,
+                            id,
+                            submit_start.elapsed().as_secs_f64() * 1000.0
+                        );
+                        (id, Some(previous_order_id))
+                    }
+                    Err(put_err) => {
+                        // The PUT itself was rejected. The most common cause is that the order
+                        // filled in the race window, so validate the replaced order for a fill
+                        // before surfacing the error.
+                        log::warn!(
+                            "submit_order: PUT for order {} failed: {} — validating replaced order for a fill",
+                            previous_order_id,
+                            put_err
+                        );
+                        return match self.resolve_order(previous_order_id, None, 0).await? {
+                            OrderOutcome::Filled(filled) => {
+                                log::info!(
+                                    "submit_order: replaced order {} is Filled after PUT failure — treating as fill",
+                                    previous_order_id
+                                );
+                                Ok(OrderOutcome::Filled(filled))
+                            }
+                            _ => Err(put_err),
+                        };
+                    }
+                }
+            }
+        };
+
+        self.resolve_order(order_id, predecessor_id, 0).await
+    }
+
+    /// Re-fetches `order_id` and classifies it into a durable [`OrderOutcome`], validating any
+    /// non-fill terminal status against the replacement chain.
+    ///
+    /// - `Filled` → [`OrderOutcome::Filled`].
+    /// - Any live/working state → [`OrderOutcome::Live`].
+    /// - Transitional states (`PendingReplace`, `PendingCancel`, `PendingRecall`, `Unknown`) are
+    ///   settled by recursing after [`RESOLVE_RETRY_DELAY`], bounded by [`MAX_RESOLVE_ATTEMPTS`].
+    /// - A non-fill terminal status (`Rejected`, `Canceled`, `Expired`, or an exhausted
+    ///   transitional) triggers a recursive check of `predecessor_id` — the order this one
+    ///   replaced. If that predecessor filled (the classic replace-after-fill race), the fill is
+    ///   reported instead of a terminal outcome.
+    ///
+    /// `attempt` tracks the transitional-retry depth and must be `0` on the first call. Recurses
+    /// via `Box::pin` because it is an async self-recursive method.
+    // finddan with AI claude-opus-4-6
+    async fn resolve_order(
         &self,
         order_id: i64,
-        new_order: model::OrderRequest,
-    ) -> Result<ReplaceOutcome, Error> {
-        use model::trader::order::Status as OrderStatus;
+        predecessor_id: Option<i64>,
+        attempt: u32,
+    ) -> Result<OrderOutcome, Error> {
+        use model::trader::order::Status as S;
 
         let order = self.fetch_order_status(order_id).await?;
 
         match order.status {
-            OrderStatus::Filled => {
-                log::info!("Order {} is already filled — skipping replace", order_id);
-                return Ok(ReplaceOutcome::AlreadyFilled(order));
-            }
-            OrderStatus::Rejected | OrderStatus::Expired | OrderStatus::Canceled => {
-                log::warn!(
-                    "Order {} reached terminal status {:?} before replace",
-                    order_id,
-                    order.status
-                );
-                let status = order.status;
-                return Ok(ReplaceOutcome::Terminal { status });
-            }
-            _ => {}
-        }
+            S::Filled => Ok(OrderOutcome::Filled(order)),
 
-        let put_start = std::time::Instant::now();
-        let put_result = PutAccountOrderRequest::new(
-            &self.client,
-            self.access_token.to_string(),
-            self.account_number.to_string(),
-            order_id,
-            new_order,
-        )
-        .send()
-        .await;
-        log::info!(
-            "replace_limit_order: PUT order {} completed in {:.0}ms",
-            order_id,
-            put_start.elapsed().as_secs_f64() * 1000.0
-        );
+            // Live, working states — the order is still active in the market.
+            S::Working
+            | S::Accepted
+            | S::Queued
+            | S::New
+            | S::PendingActivation
+            | S::AwaitingParentOrder
+            | S::AwaitingCondition
+            | S::AwaitingStopCondition
+            | S::AwaitingManualReview
+            | S::AwaitingUrOut
+            | S::AwaitingReleaseTime
+            | S::PendingAcknowledgement => Ok(OrderOutcome::Live(order_id)),
 
-        match put_result {
-            Ok(new_id) => {
+            // Transitional states — settle with a bounded, delayed retry.
+            S::PendingReplace | S::PendingCancel | S::PendingRecall | S::Unknown
+                if attempt < MAX_RESOLVE_ATTEMPTS =>
+            {
                 log::info!(
-                    "replace_limit_order: order {} replaced (new_id={:?})",
+                    "resolve_order: order {} in transitional status {:?}, retrying ({}/{})",
                     order_id,
-                    new_id
+                    order.status,
+                    attempt + 1,
+                    MAX_RESOLVE_ATTEMPTS
                 );
-                Ok(ReplaceOutcome::Replaced(new_id))
+                tokio::time::sleep(RESOLVE_RETRY_DELAY).await;
+                Box::pin(self.resolve_order(order_id, predecessor_id, attempt + 1)).await
             }
-            Err(put_err) => {
-                // The PUT can be rejected because the order filled in the brief window
-                // between the pre-replace status check and the actual PUT.  Re-fetch to
-                // confirm before surfacing an error.
-                log::warn!(
-                    "replace_limit_order: PUT for order {} failed: {} — re-fetching to check if filled",
-                    order_id,
-                    put_err
-                );
-                match self.fetch_order_status(order_id).await {
-                    Ok(order) if order.status == OrderStatus::Filled => {
+
+            // Non-fill terminal (or an exhausted transitional) status. Before treating this as a
+            // failure, check whether the order this one replaced filled in the race window.
+            status => {
+                if let Some(prev) = predecessor_id {
+                    log::info!(
+                        "resolve_order: order {} is {:?}; checking replaced order {} for a race-window fill",
+                        order_id,
+                        status,
+                        prev
+                    );
+                    if let OrderOutcome::Filled(filled) =
+                        Box::pin(self.resolve_order(prev, None, 0)).await?
+                    {
                         log::info!(
-                            "replace_limit_order: order {} is Filled after PUT failure — treating as fill",
-                            order_id
-                        );
-                        Ok(ReplaceOutcome::AlreadyFilled(order))
-                    }
-                    Ok(order) => {
-                        log::warn!(
-                            "replace_limit_order: order {} re-fetched after PUT failure — status={:?}",
+                            "resolve_order: order {} is {:?} because replaced order {} filled — treating as fill",
                             order_id,
-                            order.status
+                            status,
+                            prev
                         );
-                        Err(put_err)
-                    }
-                    Err(fetch_err) => {
-                        log::warn!(
-                            "replace_limit_order: could not re-fetch order {} after PUT failure: {}",
-                            order_id,
-                            fetch_err
-                        );
-                        Err(put_err)
+                        return Ok(OrderOutcome::Filled(filled));
                     }
                 }
+                log::warn!(
+                    "resolve_order: order {} reached terminal status {:?}",
+                    order_id,
+                    status
+                );
+                Ok(OrderOutcome::Terminal { order_id, status })
             }
         }
     }
 
     /// Handles the case where `max_attempt_duration` has elapsed.
-    /// - When `enable_market_order_conversion` is `true`, attempts to convert the open limit
-    ///   order to a market order via [`replace_limit_order`], handling fill and terminal states
-    ///   correctly.
+    /// - When `enable_market_order_conversion` is `true`, converts the open limit order to a
+    ///   market order via [`AutoMidOrderRequest::submit_order`], reporting fills (including
+    ///   race-window fills detected during the replace) and genuine terminal states correctly.
     /// - When `false`, cancels the order and returns an error.
-    // finddan with AI claude-sonnet-4-6
+    // finddan with AI claude-opus-4-6
     async fn handle_attempt_timeout(
         &self,
         current_order_id: i64,
@@ -1566,16 +1642,24 @@ impl AutoMidOrderRequest {
                 self.quantity,
             )?;
 
-            match self.replace_limit_order(current_order_id, market).await? {
-                ReplaceOutcome::Replaced(new_id) => {
+            match self
+                .submit_order(
+                    market,
+                    Submission::Replace {
+                        previous_order_id: current_order_id,
+                    },
+                )
+                .await?
+            {
+                OrderOutcome::Live(new_id) => {
                     log::info!(
-                        "Converted auto-mid {} to market order (new_id={:?})",
+                        "Converted auto-mid {} to market order (new_id={})",
                         current_order_id,
                         new_id
                     );
                     Ok(model::AutoMidOrderResponse {
                         created: true,
-                        order_id: Some(new_id.unwrap_or(current_order_id) as u64),
+                        order_id: Some(new_id as u64),
                         loops: loop_count,
                         fill_value: None,
                         market_order: true,
@@ -1585,24 +1669,16 @@ impl AutoMidOrderRequest {
                         )),
                     })
                 }
-                ReplaceOutcome::AlreadyFilled(order) => {
+                OrderOutcome::Filled(order) => {
                     log::info!(
                         "Auto-mid order {} filled (detected during market conversion)",
-                        current_order_id
+                        order.order_id
                     );
-                    let fill_value = compute_fill_value(&order, &self.instrument);
-                    Ok(model::AutoMidOrderResponse {
-                        created: true,
-                        order_id: Some(current_order_id as u64),
-                        loops: loop_count,
-                        fill_value,
-                        market_order: false,
-                        message: Some("Order filled".into()),
-                    })
+                    Ok(self.fill_response(&order, loop_count, "Order filled"))
                 }
-                ReplaceOutcome::Terminal { status } => Err(Error::AutoMid(format!(
+                OrderOutcome::Terminal { order_id, status } => Err(Error::AutoMid(format!(
                     "Order {} ended with terminal status {:?} during market conversion",
-                    current_order_id, status
+                    order_id, status
                 ))),
             }
         } else {
