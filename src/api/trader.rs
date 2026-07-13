@@ -34,7 +34,7 @@ impl GetAccountNumbersRequest {
 
     pub async fn send(self) -> Result<model::AccountNumbers, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         let status = rsp.status();
         if status != StatusCode::OK {
@@ -100,7 +100,7 @@ impl GetAccountsRequest {
 
     pub async fn send(self) -> Result<model::Accounts, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         let status = rsp.status();
         if status != StatusCode::OK {
@@ -176,7 +176,7 @@ impl GetAccountRequest {
 
     pub async fn send(self) -> Result<model::Account, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         let status = rsp.status();
         if status != StatusCode::OK {
@@ -295,7 +295,7 @@ impl GetAccountOrdersRequest {
 
     pub async fn send(self) -> Result<Vec<model::Order>, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -361,7 +361,7 @@ impl PostAccountOrderRequest {
     pub async fn send(self) -> Result<Option<i64>, Error> {
         let req = self.build();
 
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         let status = rsp.status();
 
@@ -434,7 +434,7 @@ impl GetAccountOrderRequest {
 
     pub async fn send(self) -> Result<model::Order, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -503,7 +503,7 @@ impl DeleteAccountOrderRequest {
 
     pub async fn send(self) -> Result<(), Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         let status = rsp.status();
 
@@ -573,7 +573,7 @@ impl PutAccountOrderRequest {
 
     pub async fn send(self) -> Result<Option<i64>, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         let status = rsp.status();
         if status != StatusCode::CREATED {
@@ -683,7 +683,7 @@ impl GetAccountsOrdersRequest {
 
     pub async fn send(self) -> Result<Vec<model::Order>, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         let status = rsp.status();
         if status != StatusCode::OK {
@@ -740,7 +740,7 @@ impl PostAccountPreviewOrderRequest {
 
     pub async fn send(self) -> Result<model::PreviewOrder, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         let status = rsp.status();
         if status != StatusCode::OK {
@@ -850,7 +850,7 @@ impl GetAccountTransactions {
 
     pub async fn send(self) -> Result<Vec<model::Transaction>, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -919,7 +919,7 @@ impl GetAccountTransaction {
     /// Will panic if no transaction found
     pub async fn send(self) -> Result<model::Transaction, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -963,7 +963,7 @@ impl GetUserPreferenceRequest {
 
     pub async fn send(self) -> Result<model::UserPreferences, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -1139,6 +1139,13 @@ impl AutoMidOrderRequest {
         let attempt_duration = self.max_attempt_duration.unwrap_or(60.0);
         let attempt_limit = std::time::Duration::from_secs_f64(attempt_duration);
 
+        // Absolute deadline for the entire run, measured from the moment auto-mid starts (before
+        // the initial placement). Once it passes we stop replacing and either convert to market or
+        // cancel — we never initiate a new limit replace past the budget, even when individual
+        // network calls (mid fetch, PUT replace) run long.
+        let start = std::time::Instant::now();
+        let deadline = start + attempt_limit;
+
         log::info!(
             "Auto-mid starting: instrument={:?}, quantity={}, instruction={:?}, \
              update_interval={:.1}s, max_percent_change={:.1}%, attempt_duration={:.1}s, market_conversion={}",
@@ -1197,7 +1204,6 @@ impl AutoMidOrderRequest {
             place_start.elapsed().as_secs_f64() * 1000.0
         );
 
-        let start = std::time::Instant::now();
         let interval = std::time::Duration::from_secs_f64(self.update_interval);
         let step = price_step(
             attempt_duration,
@@ -1207,12 +1213,19 @@ impl AutoMidOrderRequest {
         let mut loop_count: u32 = 0;
 
         loop {
-            tokio::time::sleep(interval).await;
-            let elapsed = start.elapsed();
+            // Sleep until the next poll, but never past the deadline so the run can't overshoot
+            // the attempt budget by a whole interval.
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return self
+                    .handle_attempt_timeout(current_order_id, attempt_duration, loop_count)
+                    .await;
+            }
+            tokio::time::sleep(interval.min(deadline - now)).await;
             loop_count += 1;
 
-            // Attempt duration elapsed — convert to market or cancel depending on config.
-            if elapsed >= attempt_limit {
+            // Attempt duration elapsed during the sleep — convert to market or cancel.
+            if std::time::Instant::now() >= deadline {
                 return self
                     .handle_attempt_timeout(current_order_id, attempt_duration, loop_count)
                     .await;
@@ -1249,6 +1262,15 @@ impl AutoMidOrderRequest {
                 percent * 100.0,
                 next_price
             );
+
+            // The mid fetch above can take several seconds. Re-check the deadline before issuing a
+            // replace so we never start a new limit order past the attempt budget — convert or
+            // cancel instead.
+            if std::time::Instant::now() >= deadline {
+                return self
+                    .handle_attempt_timeout(current_order_id, attempt_duration, loop_count)
+                    .await;
+            }
 
             let adjusted = self.limit_order(next_price)?;
 
@@ -1647,16 +1669,17 @@ impl AutoMidOrderRequest {
                 self.quantity,
             )?;
 
-            match self
+            let outcome = self
                 .submit_order(
                     market,
                     Submission::Replace {
                         previous_order_id: current_order_id,
                     },
                 )
-                .await?
-            {
-                OrderOutcome::Live(new_id) => {
+                .await;
+
+            match outcome {
+                Ok(OrderOutcome::Live(new_id)) => {
                     log::info!(
                         "Converted auto-mid {} to market order (new_id={})",
                         current_order_id,
@@ -1674,17 +1697,38 @@ impl AutoMidOrderRequest {
                         )),
                     })
                 }
-                OrderOutcome::Filled(order) => {
+                Ok(OrderOutcome::Filled(order)) => {
                     log::info!(
                         "Auto-mid order {} filled (detected during market conversion)",
                         order.order_id
                     );
                     Ok(self.fill_response(&order, loop_count, "Order filled"))
                 }
-                OrderOutcome::Terminal { order_id, status } => Err(Error::AutoMid(format!(
-                    "Order {} ended with terminal status {:?} during market conversion",
-                    order_id, status
-                ))),
+                Ok(OrderOutcome::Terminal { order_id, status }) => {
+                    // The market conversion did not take. Cancel to ensure the limit order is
+                    // closed rather than left resting past the attempt budget.
+                    log::warn!(
+                        "Market conversion for order {} ended terminal {:?}; cancelling to close",
+                        order_id,
+                        status
+                    );
+                    self.cancel_order(current_order_id).await;
+                    Err(Error::AutoMid(format!(
+                        "Order {} ended with terminal status {:?} during market conversion; cancelled",
+                        order_id, status
+                    )))
+                }
+                Err(e) => {
+                    // The conversion request itself failed. Cancel to ensure the limit order is
+                    // closed rather than left resting past the attempt budget.
+                    log::warn!(
+                        "Market conversion for order {} failed: {}; cancelling to close",
+                        current_order_id,
+                        e
+                    );
+                    self.cancel_order(current_order_id).await;
+                    Err(e)
+                }
             }
         } else {
             log::warn!(

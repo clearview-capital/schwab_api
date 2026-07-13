@@ -100,7 +100,7 @@ impl GetQuotesRequest {
 
     pub async fn send(self) -> Result<HashMap<String, model::QuoteResponse>, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -194,7 +194,7 @@ impl GetQuoteRequest {
     pub async fn send(self) -> Result<model::QuoteResponse, Error> {
         let symbol = self.symbol.clone();
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         //let json = rsp.text().await.unwrap();
         //dbg!(&json);
@@ -505,7 +505,7 @@ impl GetOptionChainsRequest {
         let req = self.build();
 
         //println!("Create request: {:?}", req);
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -553,7 +553,7 @@ impl GetOptionExpirationChainRequest {
 
     pub async fn send(self) -> Result<model::ExpirationChain, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -785,7 +785,7 @@ impl GetPriceHistoryRequest {
 
     pub async fn send(self) -> Result<model::CandleList, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -889,7 +889,7 @@ impl GetMoversRequest {
 
     pub async fn send(self) -> Result<model::Mover, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -971,7 +971,7 @@ impl GetMarketsRequest {
 
     pub async fn send(self) -> Result<model::Markets, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -1047,7 +1047,7 @@ impl GetMarketRequest {
 
     pub async fn send(self) -> Result<model::Markets, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -1112,7 +1112,7 @@ impl GetInstrumentsRequest {
 
     pub async fn send(self) -> Result<model::Instruments, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);
@@ -1168,7 +1168,7 @@ impl GetInstrumentRequest {
     /// Will panic if no Instrument
     pub async fn send(self) -> Result<model::InstrumentResponse, Error> {
         let req = self.build();
-        let rsp = req.send().await?;
+        let rsp = super::send_timed(req).await?;
 
         // let json = rsp.text().await.unwrap();
         // dbg!(&json);

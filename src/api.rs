@@ -5,11 +5,49 @@ pub mod market_data;
 pub mod parameter;
 pub mod trader;
 
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, Response};
 
 use crate::token::Tokener;
 use crate::{error::Error, model};
 use parameter::{Market, Projection, TransactionType};
+
+/// Executes a built request against a Schwab endpoint, logging the HTTP method, URL path,
+/// resulting status, and wall-clock duration at info level.
+///
+/// Centralising the send here ensures every Schwab API call is timed consistently. The request
+/// is split from its client (`build_split`) so the method and URL can be read for the log line
+/// before the request is consumed by execution; a malformed request surfaces as an error just
+/// as [`RequestBuilder::send`] would.
+// finddan with AI claude-opus-4-6
+pub(crate) async fn send_timed(req: RequestBuilder) -> Result<Response, Error> {
+    let (client, request) = req.build_split();
+    let request = request?;
+    let method = request.method().clone();
+    let url = request.url().clone();
+
+    let start = std::time::Instant::now();
+    let result = client.execute(request).await;
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    match &result {
+        Ok(rsp) => log::info!(
+            "Schwab {} {} -> {} in {:.0}ms",
+            method,
+            url.path(),
+            rsp.status().as_u16(),
+            elapsed_ms
+        ),
+        Err(e) => log::info!(
+            "Schwab {} {} failed in {:.0}ms: {}",
+            method,
+            url.path(),
+            elapsed_ms,
+            e
+        ),
+    }
+
+    result.map_err(Into::into)
+}
 
 /// Interacting with the Schwab API.
 #[derive(Debug)]
