@@ -1167,12 +1167,7 @@ impl AutoMidOrderRequest {
             .map_err(|e| Error::AutoMid(format!("Failed to fetch initial mid price: {e}")))?;
 
         // Place the initial limit order at the current mid.
-        let initial = model::OrderRequest::limit(
-            self.instrument.clone(),
-            self.instruction,
-            self.quantity,
-            initial_quote.mid,
-        )?;
+        let initial = self.limit_order(initial_quote.mid)?;
 
         log::debug!(
             "Auto mid order will create the following initial order: {:?}",
@@ -1255,12 +1250,7 @@ impl AutoMidOrderRequest {
                 next_price
             );
 
-            let adjusted = model::OrderRequest::limit(
-                self.instrument.clone(),
-                self.instruction,
-                self.quantity,
-                next_price,
-            )?;
+            let adjusted = self.limit_order(next_price)?;
 
             // Replace the working order. `submit_order` validates any rejection against the
             // order being replaced, so a race-window fill is reported as a success rather
@@ -1426,6 +1416,21 @@ impl AutoMidOrderRequest {
             ask,
             mid: mid_rounded,
         })
+    }
+
+    /// Builds a limit [`model::OrderRequest`] for this auto-mid run at `price`, marked
+    /// `AllOrNone` so the order can only execute in full. This prevents partial fills, which
+    /// would otherwise leave a residual position stranded whenever the order is replaced.
+    // finddan with AI claude-opus-4-6
+    fn limit_order(&self, price: f64) -> Result<model::OrderRequest, Error> {
+        let mut order = model::OrderRequest::limit(
+            self.instrument.clone(),
+            self.instruction,
+            self.quantity,
+            price,
+        )?;
+        order.special_instruction = Some(model::trader::order::SpecialInstruction::AllOrNone);
+        Ok(order)
     }
 
     /// Builds a successful [`model::AutoMidOrderResponse`] for a filled order, using the order's
