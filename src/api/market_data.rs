@@ -206,7 +206,14 @@ impl GetQuoteRequest {
                 if should_retry {
                     if let Some(retry) = retry_req {
                         log::warn!("GetQuoteRequest for {symbol} failed ({e}), retrying once");
-                        return Self::do_send(retry, &symbol).await;
+                        let retry_result = Self::do_send(retry, &symbol).await;
+                        match &retry_result {
+                            Ok(_) => log::info!("GetQuoteRequest retry for {symbol} succeeded"),
+                            Err(e) => {
+                                log::error!("GetQuoteRequest retry for {symbol} also failed: {e}")
+                            }
+                        }
+                        return retry_result;
                     }
                 }
                 Err(e)
