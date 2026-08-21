@@ -3,6 +3,7 @@
 
 use reqwest::{Client, RequestBuilder, Response, StatusCode};
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::parameter::{
     ContractType, Entitlement, FrequencyType, Market, Month, OptionChainStrategy, PeriodType,
@@ -150,7 +151,8 @@ impl GetQuoteRequest {
     pub(crate) fn new(client: &Client, access_token: String, symbol: String) -> Self {
         let req = client
             .get(Self::endpoint(symbol.clone()).url())
-            .bearer_auth(access_token);
+            .bearer_auth(access_token)
+            .timeout(Duration::from_secs(5));
         Self::new_with(req, symbol)
     }
 
@@ -194,13 +196,26 @@ impl GetQuoteRequest {
     pub async fn send(self) -> Result<model::QuoteResponse, Error> {
         let symbol = self.symbol.clone();
         let req = self.build();
-        let rsp = super::send_timed(req).await?;
+        let retry_req = req.try_clone();
 
-        //let json = rsp.text().await.unwrap();
-        //dbg!(&json);
-        //let item: HashMap<String, model::QuoteResponse> = serde_json::from_str(&json).unwrap();
-        //println!("{:#?}", item);
-        //panic!();
+        match Self::do_send(req, &symbol).await {
+            Ok(val) => Ok(val),
+            Err(e) => {
+                let should_retry =
+                    matches!(&e, Error::Reqwest(re) if re.is_timeout() || re.is_connect());
+                if should_retry {
+                    if let Some(retry) = retry_req {
+                        log::warn!("GetQuoteRequest for {symbol} failed ({e}), retrying once");
+                        return Self::do_send(retry, &symbol).await;
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn do_send(req: RequestBuilder, symbol: &str) -> Result<model::QuoteResponse, Error> {
+        let rsp = super::send_timed(req).await?;
 
         let status = rsp.status();
         if status != StatusCode::OK {
@@ -214,7 +229,7 @@ impl GetQuoteRequest {
             return Err(Error::Quote(e));
         }
 
-        let val = map.responses.remove(&symbol).expect("must exist");
+        let val = map.responses.remove(symbol).expect("must exist");
         Ok(val)
     }
 }
